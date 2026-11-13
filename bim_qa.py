@@ -70,6 +70,10 @@ def _area_candidates(obj: Dict[str, Any]) -> List[Tuple[int, float, str, str, st
 
     add_entries(obj.get("quantities", {}), True)
     add_entries(obj.get("properties", {}), False)
+    # Geometry-derived fallback from bim_parser (used only when nothing authored exists).
+    for name, record in (obj.get("computed_quantities") or {}).items():
+        if isinstance(record, dict) and _number(record.get("value")) is not None:
+            candidates.append((9, _number(record["value"]), "m2", "computed_geometry", name))
     candidates.sort(key=lambda item: item[0])
     positive = [candidate for candidate in candidates if candidate[1] > 0]
     return positive
