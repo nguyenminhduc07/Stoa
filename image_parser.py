@@ -9,10 +9,19 @@ import struct
 from typing import Any, Dict, List, Optional, Tuple
 
 from floorplan_model import CATEGORY_NAMES, MODEL_VERSION, SharedFloorplanCounter, require_torch
+from floorplan_geometry_model import (
+    GEOMETRY_MODEL_VERSION,
+    ICON_CLASSES,
+    ICON_COUNT_CLASS,
+    ROOM_CLASSES,
+    ROOM_COUNT_CLASS,
+    FloorplanGeometryNet,
+)
 
 
 SUPPORTED_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 _COUNT_MODEL_CACHE: Dict[str, Tuple[Any, Any, int]] = {}
+_GEOMETRY_MODEL_CACHE: Dict[str, Tuple[Any, Any, Any]] = {}
 
 
 def _png_dimensions(data: bytes) -> Optional[Tuple[int, int]]:
@@ -186,11 +195,167 @@ def _count_prediction(image_path: str | Path, checkpoint_path: str | Path, categ
     }
 
 
+def _load_geometry_model(checkpoint_path: str | Path):
+    torch = require_torch()
+    path = Path(checkpoint_path).resolve()
+    key = str(path)
+    if key in _GEOMETRY_MODEL_CACHE:
+        return _GEOMETRY_MODEL_CACHE[key]
+    if not path.is_file():
+        raise FileNotFoundError(f"Geometry model checkpoint not found: {path}")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    try:
+        checkpoint = torch.load(path, map_location=device, weights_only=True)
+    except TypeError:
+        checkpoint = torch.load(path, map_location=device)
+    if checkpoint.get("model_version") != GEOMETRY_MODEL_VERSION:
+        raise ValueError(f"Unsupported geometry model version: {checkpoint.get('model_version')}")
+    if tuple(checkpoint.get("rooms", [])) != ROOM_CLASSES or tuple(checkpoint.get("icons", [])) != ICON_CLASSES:
+        raise ValueError("Geometry checkpoint class mapping does not match this parser")
+    if tuple(checkpoint.get("count_categories", [])) != CATEGORY_NAMES:
+        raise ValueError("Geometry checkpoint count heads do not match this parser")
+    model = FloorplanGeometryNet().to(device)
+    model.load_state_dict(checkpoint["state_dict"])
+    model.eval()
+    cached = (model, checkpoint, device)
+    _GEOMETRY_MODEL_CACHE[key] = cached
+    return cached
+
+
+def _connected_components(mask, minimum_area: int) -> List[Dict[str, int]]:
+    """Return 8-connected component bounds, using OpenCV when available."""
+    import numpy as np
+
+    binary = np.asarray(mask, dtype=np.uint8)
+    if not binary.any():
+        return []
+    try:
+        import cv2
+        count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(binary, connectivity=8)
+        return [
+            {"x0": int(x), "y0": int(y), "x1": int(x + width), "y1": int(y + height), "area": int(area)}
+            for x, y, width, height, area in stats[1:count]
+            if int(area) >= minimum_area
+        ]
+    except ImportError:
+        height, width = binary.shape
+        visited = np.zeros(binary.shape, dtype=np.bool_)
+        components = []
+        for y, x in np.argwhere(binary):
+            y, x = int(y), int(x)
+            if visited[y, x]:
+                continue
+            visited[y, x] = True
+            stack = [(y, x)]
+            x0 = x1 = x
+            y0 = y1 = y
+            area = 0
+            while stack:
+                cy, cx = stack.pop()
+                area += 1
+                x0, x1 = min(x0, cx), max(x1, cx)
+                y0, y1 = min(y0, cy), max(y1, cy)
+                for ny in range(max(0, cy - 1), min(height, cy + 2)):
+                    for nx in range(max(0, cx - 1), min(width, cx + 2)):
+                        if binary[ny, nx] and not visited[ny, nx]:
+                            visited[ny, nx] = True
+                            stack.append((ny, nx))
+            if area >= minimum_area:
+                components.append({"x0": x0, "y0": y0, "x1": x1 + 1, "y1": y1 + 1, "area": area})
+        return components
+
+
+def _geometry_prediction(
+    image_path: str | Path,
+    checkpoint_path: str | Path,
+    *,
+    confidence_threshold: float = 0.45,
+) -> Dict[str, Any]:
+    torch = require_torch()
+    import numpy as np
+    try:
+        from PIL import Image, ImageOps
+    except ImportError as exc:
+        raise RuntimeError("Geometry inference requires Pillow: pip install pillow") from exc
+
+    model, checkpoint, device = _load_geometry_model(checkpoint_path)
+    size = int(checkpoint["image_size"])
+    with Image.open(image_path) as source:
+        image = ImageOps.exif_transpose(source).convert("RGB")
+        original_width, original_height = image.size
+        scale = min(size / original_width, size / original_height)
+        resized_size = (max(1, round(original_width * scale)), max(1, round(original_height * scale)))
+        image = image.resize(resized_size, Image.Resampling.LANCZOS)
+        offset = ((size - resized_size[0]) // 2, (size - resized_size[1]) // 2)
+        canvas = Image.new("RGB", (size, size), (255, 255, 255))
+        canvas.paste(image, offset)
+        data = torch.frombuffer(bytearray(canvas.tobytes()), dtype=torch.uint8)
+        tensor = data.reshape(size, size, 3).permute(2, 0, 1).float().div(127.5).sub(1.0)
+
+    with torch.no_grad():
+        outputs = model(tensor.unsqueeze(0).to(device))
+        room_prob = torch.softmax(outputs["rooms"][0], dim=0).cpu().numpy()
+        icon_prob = torch.softmax(outputs["icons"][0], dim=0).cpu().numpy()
+        count_log = outputs["count_log1p"][0].cpu().numpy()
+
+    x0, y0 = offset
+    resized_width, resized_height = resized_size
+    room_prob = room_prob[:, y0:y0 + resized_height, x0:x0 + resized_width]
+    icon_prob = icon_prob[:, y0:y0 + resized_height, x0:x0 + resized_width]
+    scale_x, scale_y = original_width / resized_width, original_height / resized_height
+
+    def extract_regions(probabilities, class_names, minimum_area, excluded=(0,)):
+        labels = probabilities.argmax(axis=0)
+        confidence = probabilities.max(axis=0)
+        result = []
+        for class_id, class_name in enumerate(class_names):
+            if class_id in excluded:
+                continue
+            class_mask = (labels == class_id) & (probabilities[class_id] >= confidence_threshold)
+            for component in _connected_components(class_mask, minimum_area):
+                bounds = component
+                bbox = [
+                    max(0, int(bounds["x0"] * scale_x)),
+                    max(0, int(bounds["y0"] * scale_y)),
+                    min(original_width, int(math.ceil(bounds["x1"] * scale_x))),
+                    min(original_height, int(math.ceil(bounds["y1"] * scale_y))),
+                ]
+                region_confidence = float(probabilities[class_id,
+                    bounds["y0"]:bounds["y1"], bounds["x0"]:bounds["x1"]].mean())
+                result.append({
+                    "class": class_name,
+                    "bbox": bbox,
+                    "area_px": int(round(component["area"] * scale_x * scale_y)),
+                    "confidence": round(region_confidence, 4),
+                })
+        return result
+
+    # Small icon regions are retained; room geometry uses a larger area floor
+    # to suppress isolated pixel noise.
+    icons = extract_regions(icon_prob, ICON_CLASSES, minimum_area=3)
+    rooms = extract_regions(room_prob, ROOM_CLASSES, minimum_area=12)
+    auxiliary_counts = {
+        category: max(0, int(round(math.expm1(max(0.0, float(count_log[index]))))))
+        for index, category in enumerate(CATEGORY_NAMES)
+    }
+    return {
+        "source": str(Path(image_path).resolve()),
+        "width": original_width,
+        "height": original_height,
+        "icons": icons,
+        "rooms": rooms,
+        "auxiliary_counts": auxiliary_counts,
+        "count_mae": checkpoint.get("metrics", {}).get("qa_count_mae", {}),
+        "confidence_threshold": confidence_threshold,
+    }
+
+
 def answer_image_question(
     question: str,
     document: Dict[str, Any],
     *,
     model_path: str | Path | None = None,
+    geometry_model_path: str | Path | None = None,
 ) -> Dict[str, Any]:
     """Answer OCR lookups or learned image-level count questions.
 
@@ -219,6 +384,69 @@ def answer_image_question(
                     "answer": " ".join(word["text"] for word in found),
                     "evidence": [{**evidence, "bbox": found[0].get("bbox"), "ocr_words": found}],
                 }
+
+    if geometry_model_path is not None and document.get("drawing_type") == "floor_plan":
+        from train_floorplan_model import question_category
+
+        category = question_category(question)
+        if category:
+            path = source
+            if not path:
+                raise ValueError("Parsed image is missing its source path")
+            geometry = _geometry_prediction(path, geometry_model_path)
+            icon_class = ICON_COUNT_CLASS.get(category)
+            room_class = ROOM_COUNT_CLASS.get(category)
+            if icon_class:
+                regions = [region for region in geometry["icons"] if region["class"] == icon_class]
+                method = "geometry_icon_mask_components"
+            elif room_class:
+                regions = [region for region in geometry["rooms"] if region["class"] == room_class]
+                method = "geometry_room_mask_components"
+            else:
+                regions = None
+
+            if regions is not None:
+                count = len(regions)
+                region_evidence = [
+                    {"source": path, "page": 1, "bbox": region["bbox"],
+                     "coordinate_system": "image pixels; origin at top-left",
+                     "class": region["class"], "confidence": region["confidence"]}
+                    for region in regions
+                ]
+                if not region_evidence:
+                    region_evidence = [evidence]
+                auxiliary = geometry["auxiliary_counts"].get(category)
+                return {
+                    "status": "answered",
+                    "answer": count,
+                    "answer_text": f"{count} {category.replace('_', ' ')}",
+                    "method": method,
+                    "auxiliary_count_estimate": auxiliary,
+                    "review_recommended": auxiliary is not None and auxiliary != count,
+                    "evidence": region_evidence,
+                }
+
+            # Some QA categories (for example storeys and shower fixtures) do
+            # not have matching classes in the CubiCasa masks. Keep their
+            # learned image-level estimate separate from geometric detections.
+            if geometry["count_mae"].get(category) is None:
+                return {
+                    "status": "not_found",
+                    "answer": None,
+                    "reason": (
+                        f"The geometry taxonomy has no direct class for {category}, "
+                        "and this checkpoint has no QA supervision for its auxiliary count head."
+                    ),
+                    "evidence": [evidence],
+                }
+            return {
+                "status": "answered",
+                "answer": geometry["auxiliary_counts"][category],
+                "answer_text": f"{geometry['auxiliary_counts'][category]} {category.replace('_', ' ')}",
+                "method": "weakly_supervised_count_head",
+                "review_recommended": True,
+                "evidence": [evidence],
+            }
 
     if model_path is not None and document.get("drawing_type") == "floor_plan":
         from train_floorplan_model import question_category
