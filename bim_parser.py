@@ -95,6 +95,26 @@ def _read_sets(element: Any) -> tuple[Dict[str, Any], Dict[str, Any]]:
     return properties, quantities
 
 
+def space_net_floor_area(index: Dict[str, Any], room: str, storey: str) -> Optional[Dict[str, Any]]:
+    """Look up a room's net floor area in a parse_ifc() index, with its evidence.
+
+    Prefers authored quantities; falls back to geometry-derived ones.
+    """
+    for obj in index["objects"]:
+        if obj["ifc_type"] != "IfcSpace" or (obj["storey"] or {}).get("name") != storey:
+            continue
+        if room not in {obj["label"], obj["name"], obj["long_name"]}:
+            continue
+        for set_name, qset in obj["quantities"].items():
+            for qname, q in qset.items():
+                if "NetFloorArea" in qname and q.get("value") is not None:
+                    return {"value": q["value"], "method": f"authored {set_name}.{qname}", "source": obj["source"]}
+        q = obj["computed_quantities"].get("NetFloorArea")
+        if q:
+            return {"value": q["value"], "method": q["method"], "source": obj["source"]}
+    return None
+
+
 def _storey_for(element: Any) -> Optional[Dict[str, Any]]:
     for rel in getattr(element, "ContainedInStructure", ()) or ():
         structure = getattr(rel, "RelatingStructure", None)
@@ -118,7 +138,46 @@ def _storey_for(element: Any) -> Optional[Dict[str, Any]]:
     return None
 
 
-def parse_ifc(file_path: str | Path) -> Dict[str, Any]:
+def _space_label(element: Any) -> Optional[str]:
+    """Human room label as used in drawings/questions, e.g. 'TUALETTRUUM (55-3)'."""
+    long_name = _value(getattr(element, "LongName", None))
+    name = _value(getattr(element, "Name", None))
+    if long_name and name and long_name != name:
+        return f"{long_name} ({name})"
+    return long_name or name
+
+
+def _has_quantity(quantities: Dict[str, Any], key: str) -> bool:
+    return any(
+        key in qname and q.get("value") is not None
+        for qset in quantities.values() for qname, q in qset.items()
+    )
+
+
+def _geometry_quantities(model: Any, element: Any) -> Dict[str, Any]:
+    """Derive quantities from geometry when the model does not author them.
+
+    Many exported models carry no Qto_*BaseQuantities. For spaces we compute the
+    plan footprint area (world coordinates, metres). Values are marked as
+    geometry-derived so answers can say where the number came from.
+    """
+    import ifcopenshell.geom as geom
+    import ifcopenshell.util.shape as shape_util
+
+    settings = geom.settings()
+    settings.set("use-world-coords", True)
+    shape = geom.create_shape(settings, element)
+    result: Dict[str, Any] = {}
+    if element.is_a("IfcSpace"):
+        result["NetFloorArea"] = {
+            "value": round(shape_util.get_footprint_area(shape.geometry), 4),
+            "unit": "m2",
+            "method": "geometry footprint area (ifcopenshell)",
+        }
+    return result
+
+
+def parse_ifc(file_path: str | Path, compute_geometry: bool = True) -> Dict[str, Any]:
     """Parse an IFC file into project metadata and searchable object records.
 
     Each record retains its model path and IFC GUID so an answer can cite the
@@ -159,16 +218,24 @@ def parse_ifc(file_path: str | Path) -> Dict[str, Any]:
         if not guid:
             continue
         properties, quantities = _read_sets(element)
+        computed: Dict[str, Any] = {}
+        if compute_geometry and element.is_a("IfcSpace") and not _has_quantity(quantities, "NetFloorArea"):
+            try:
+                computed = _geometry_quantities(model, element)
+            except Exception as exc:  # geometry kernels fail on some malformed shapes
+                computed = {"error": f"{type(exc).__name__}: {exc}"}
         objects.append({
             "guid": guid,
             "ifc_type": element.is_a(),
             "name": _value(getattr(element, "Name", None)),
             "long_name": _value(getattr(element, "LongName", None)),
+            "label": _space_label(element) if element.is_a("IfcSpace") else _value(getattr(element, "Name", None)),
             "description": _value(getattr(element, "Description", None)),
             "object_type": _value(getattr(element, "ObjectType", None)),
             "storey": _storey_for(element),
             "properties": properties,
             "quantities": quantities,
+            "computed_quantities": computed,
             "source": {"model": str(path), "ifc_id": element.id(), "guid": guid},
         })
 
