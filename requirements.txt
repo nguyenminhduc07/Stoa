@@ -1,0 +1,7 @@
+ifcopenshell
+ezdxf
+pdfplumber
+Pillow
+# optional, only for CLIP image routing in file_classifier.py:
+# transformers
+# torch
