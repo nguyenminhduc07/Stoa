@@ -25,7 +25,7 @@ format: IFC > DXF > vector PDF > raster image.
 | `evaluate_bim_area.py` | eval for IFC area questions | Duc |
 | `cad_parser.py` | DXF/DWG parsing (Swiss dwellings) | Duc |
 | `pdf_parser.py` / `evaluate_pdf_text.py` | PDF schedules + eval | Duc |
-| _(add yours here)_ | | |
+| `image_parser.py`, `floorplan_model.py`, `floorplan_geometry_model.py`, `train_floorplan*.py`, `prepare_cubicasa_masks.py` | raster evidence and floor-plan CNNs | Codex |
 
 Only edit files you own. If you must change someone else's file, keep the diff minimal and
 say so in the PR description.
