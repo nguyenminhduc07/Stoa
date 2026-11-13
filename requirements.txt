@@ -2,6 +2,10 @@ ifcopenshell
 ezdxf
 pdfplumber
 Pillow
+numpy
+scikit-image
+svgpathtools
 # optional, only for CLIP image routing in file_classifier.py:
 # transformers
-# torch
+# Install torch from the PyTorch selector with the desired CUDA build; a plain
+# pip install can replace it with a CPU-only build.
