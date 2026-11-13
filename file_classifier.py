@@ -3,8 +3,6 @@ from importlib import import_module
 from pathlib import Path
 from typing import Dict, Optional
 
-from PIL import Image, UnidentifiedImageError
-
 class DocumentRouter:
     # CLIP provides useful zero-shot classification without training a model on
     # this dataset. It is loaded only if an image's source does not determine
@@ -103,8 +101,14 @@ class DocumentRouter:
             return "floor_plan"
 
         try:
+            from PIL import Image, UnidentifiedImageError
             with Image.open(file_path) as image:
                 image = image.convert("RGB")
+        except ImportError as exc:
+            raise RuntimeError(
+                "Classifying mixed-source raster images needs Pillow, transformers, and torch. "
+                "Install them with: pip install pillow transformers torch"
+            ) from exc
         except (UnidentifiedImageError, OSError) as exc:
             raise ValueError(f"Cannot read image file: {file_path}") from exc
 
