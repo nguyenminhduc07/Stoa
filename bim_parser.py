@@ -163,6 +163,7 @@ def parse_ifc(file_path: str | Path) -> Dict[str, Any]:
             "guid": guid,
             "ifc_type": element.is_a(),
             "name": _value(getattr(element, "Name", None)),
+            "long_name": _value(getattr(element, "LongName", None)),
             "description": _value(getattr(element, "Description", None)),
             "object_type": _value(getattr(element, "ObjectType", None)),
             "storey": _storey_for(element),
