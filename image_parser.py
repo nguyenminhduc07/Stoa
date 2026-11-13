@@ -1,19 +1,18 @@
-"""Read raster drawing metadata and return verifiable image evidence.
-
-The parser deliberately does not infer symbol counts from image dimensions or
-OCR.  A vision/OCR backend can enrich the returned OCR records later; until
-then, visual count questions are reported as unsupported instead of guessed.
-"""
+"""Read raster drawings and answer floor-plan count questions with a CNN."""
 
 from __future__ import annotations
 
 from pathlib import Path
+import math
 import re
 import struct
 from typing import Any, Dict, List, Optional, Tuple
 
+from floorplan_model import CATEGORY_NAMES, MODEL_VERSION, SharedFloorplanCounter, require_torch
+
 
 SUPPORTED_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
+_COUNT_MODEL_CACHE: Dict[str, Tuple[Any, Any, int]] = {}
 
 
 def _png_dimensions(data: bytes) -> Optional[Tuple[int, int]]:
@@ -134,11 +133,70 @@ def parse_image(file_path: str | Path, *, run_ocr: bool = True) -> Dict[str, Any
     }
 
 
-def answer_image_question(question: str, document: Dict[str, Any]) -> Dict[str, Any]:
-    """Answer literal OCR lookups; defer visual reasoning without a vision backend.
+def _load_count_model(checkpoint_path: str | Path):
+    torch = require_torch()
+    path = Path(checkpoint_path).resolve()
+    key = str(path)
+    if key in _COUNT_MODEL_CACHE:
+        return _COUNT_MODEL_CACHE[key]
+    if not path.is_file():
+        raise FileNotFoundError(f"Floor-plan model checkpoint not found: {path}")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    try:
+        checkpoint = torch.load(path, map_location=device, weights_only=True)
+    except TypeError:  # PyTorch versions before weights_only was introduced.
+        checkpoint = torch.load(path, map_location=device)
+    if checkpoint.get("model_version") != MODEL_VERSION:
+        raise ValueError(f"Unsupported floor-plan model version: {checkpoint.get('model_version')}")
+    categories = checkpoint.get("categories", [])
+    if tuple(categories) != CATEGORY_NAMES:
+        raise ValueError("Checkpoint count categories do not match this parser version")
+    model = SharedFloorplanCounter(categories).to(device)
+    model.load_state_dict(checkpoint["state_dict"])
+    model.eval()
+    cached = (model, checkpoint, device)
+    _COUNT_MODEL_CACHE[key] = cached
+    return cached
 
-    The result schema matches the PDF answerer: ``answered`` results carry
-    pixel-coordinate evidence, while unsupported questions state why.
+
+def _count_prediction(image_path: str | Path, checkpoint_path: str | Path, category: str) -> Tuple[int, Dict[str, Any]]:
+    torch = require_torch()
+    try:
+        from PIL import Image, ImageOps
+    except ImportError as exc:
+        raise RuntimeError("CNN image inference requires Pillow: pip install pillow") from exc
+
+    model, checkpoint, device = _load_count_model(checkpoint_path)
+    image_size = int(checkpoint["image_size"])
+    with Image.open(image_path) as source:
+        image = ImageOps.exif_transpose(source).convert("RGB")
+        image.thumbnail((image_size, image_size), Image.Resampling.LANCZOS)
+        canvas = Image.new("RGB", (image_size, image_size), (255, 255, 255))
+        canvas.paste(image, ((image_size - image.width) // 2, (image_size - image.height) // 2))
+        pixels = torch.frombuffer(bytearray(canvas.tobytes()), dtype=torch.uint8)
+        tensor = pixels.reshape(image_size, image_size, 3).permute(2, 0, 1).float().div(127.5).sub(1.0)
+    with torch.no_grad():
+        prediction = model(tensor.unsqueeze(0).to(device))[category].item()
+    count = max(0, int(round(math.expm1(max(0.0, prediction)))))
+    mae = checkpoint.get("validation_mae_counts", {}).get(category)
+    return count, {
+        "model_version": checkpoint["model_version"],
+        "category": category,
+        "validation_mae_count": mae,
+    }
+
+
+def answer_image_question(
+    question: str,
+    document: Dict[str, Any],
+    *,
+    model_path: str | Path | None = None,
+) -> Dict[str, Any]:
+    """Answer OCR lookups or learned image-level count questions.
+
+    Count predictions cite the image bounds. The QA-supervised model does not
+    predict object locations, so callers should present the result as a count
+    estimate and make the full drawing available for review.
     """
     source = document.get("source", {}).get("path")
     evidence = {
@@ -162,12 +220,33 @@ def answer_image_question(question: str, document: Dict[str, Any]) -> Dict[str, 
                     "evidence": [{**evidence, "bbox": found[0].get("bbox"), "ocr_words": found}],
                 }
 
+    if model_path is not None and document.get("drawing_type") == "floor_plan":
+        from train_floorplan_model import question_category
+
+        category = question_category(question)
+        if category:
+            image_path = source
+            if not image_path:
+                raise ValueError("Parsed image is missing its source path")
+            count, model_info = _count_prediction(image_path, model_path, category)
+            label = category.replace("_", " ")
+            return {
+                "status": "answered",
+                "answer": count,
+                "answer_text": f"{count} {label}",
+                "method": "shared_cnn_count_head",
+                "model": model_info,
+                "review_recommended": True,
+                "evidence": [evidence],
+            }
+
     return {
         "status": "unsupported",
         "answer": None,
         "reason": (
-            "This image question requires visual symbol recognition or spatial reasoning. "
-            "The current image parser only extracts metadata and optional OCR text."
+            "This image question needs visual reasoning. Supply a trained floor-plan "
+            "count-model checkpoint for supported count questions; the current QA-trained "
+            "model estimates image-level totals and does not localize individual objects."
         ),
         "evidence": [evidence],
     }
