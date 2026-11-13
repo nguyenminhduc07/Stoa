@@ -25,6 +25,7 @@ format: IFC > DXF > vector PDF > raster image.
 | `evaluate_bim_area.py` | eval for IFC area questions | Duc |
 | `cad_parser.py` | DXF/DWG parsing (Swiss dwellings) | Duc |
 | `pdf_parser.py` / `evaluate_pdf_text.py` | PDF schedules + eval | Duc |
+| `cad_qa.py` / `evaluate_cad.py` | DXF floor-plan answers (Swiss dwellings) + eval | Minh |
 | _(add yours here)_ | | |
 
 Only edit files you own. If you must change someone else's file, keep the diff minimal and
@@ -53,4 +54,5 @@ say so in the PR description.
 pip install -r requirements.txt
 python evaluate_bim_area.py --questions junction-dataset-preview/questions.jsonl --data junction-dataset-preview/data
 python evaluate_pdf_text.py --questions junction-dataset-preview/questions.jsonl --data junction-dataset-preview/data
+python evaluate_cad.py --questions junction-dataset-preview/questions.jsonl --data junction-dataset-preview/data
 ```
