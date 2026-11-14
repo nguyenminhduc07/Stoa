@@ -71,6 +71,7 @@ class ConversationPipeline:
         self.geometry_model = Path(geometry_model) if geometry_model else None
         self.files: Dict[str, FileEntry] = {}
         self._groups: Dict[str, List[str]] = {}
+        self._active_group: Optional[str] = None
         self._lock = threading.RLock()
         self._vision_classifier = None
         self.classification_warnings: Dict[str, str] = {}
@@ -187,6 +188,7 @@ class ConversationPipeline:
             entry = self.files.get(file_id)
             if entry is None:
                 return None, {"status": "not_found", "reason": f"Unknown file_id: {file_id}", "evidence": []}
+            self._active_group = entry.group_id
             return self._groups[entry.group_id], None
         if not self.files:
             return None, {"status": "not_found", "reason": "No files have been uploaded to this conversation.", "evidence": []}
@@ -198,15 +200,22 @@ class ConversationPipeline:
             if len(stem) >= 4 and (stem in normalized or entry.path.name.casefold() in normalized):
                 mentioned_groups.add(entry.group_id)
         if len(mentioned_groups) == 1:
-            return self._groups[next(iter(mentioned_groups))], None
+            group = next(iter(mentioned_groups))
+            self._active_group = group
+            return self._groups[group], None
 
         groups = list(dict.fromkeys(entry.group_id for entry in self.files.values()))
         if len(groups) == 1:
+            self._active_group = groups[0]
             return self._groups[groups[0]], None
         if mentioned_groups:
             groups = [group for group in groups if group in mentioned_groups]
             if len(groups) == 1:
+                self._active_group = groups[0]
                 return self._groups[groups[0]], None
+        follow_up = re.search(r"\b(?:it|its|this|that|there|same)\b", normalized)
+        if follow_up and self._active_group in self._groups:
+            return self._groups[self._active_group], None
         options = []
         for group in groups:
             members = [self.files[item] for item in self._groups[group]]
@@ -342,5 +351,6 @@ class ConversationPipeline:
         with self._lock:
             self.files.clear()
             self._groups.clear()
+            self._active_group = None
             self.classification_warnings.clear()
             self._vision_classifier = None
