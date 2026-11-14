@@ -1,7 +1,7 @@
 """One score for the whole system: route every question to its answerer and grade it.
 
 Routing (most exact format first, per AGENTS.md):
-  IFC model, or a plan PDF rendered from one  -> bim_parser + bim_qa   (area questions)
+  IFC model, or a plan PDF rendered from one  -> ifc_qa (counts, wall/slab quantities), bim_qa (room areas)
   DXF twin with the same stem                  -> cad_qa
   PDF                                          -> pdf_parser
   raster image, room-type question             -> room_label_qa (OCR of room labels)
@@ -104,8 +104,10 @@ class Router:
 
         model = self._ifc_model(path)
         if model is not None:
-            if kind != "area":
-                return "ifc", {"status": "unsupported", "reason": "IFC answerer handles area questions only."}
+            from ifc_qa import IfcIndex, answer_ifc_question
+            result = answer_ifc_question(question, self._cached("ifc-index", model, IfcIndex))
+            if result.get("status") != "unsupported" or kind != "area":
+                return "ifc", result
             from bim_parser import parse_ifc
             from bim_qa import answer_area_question
             return "ifc", answer_area_question(question, self._cached("ifc", model, parse_ifc))

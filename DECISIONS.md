@@ -9,3 +9,4 @@
 - 2026-11-14 - Uploaded-file parsing and cache are scoped to a conversation instance and lazy-loaded; this avoids persistent storage while isolating chats.
 - 2026-11-14 - Chat API keeps conversation state in process and on local temporary storage; use one server worker and close sessions to clear files - avoids introducing a database before persistence is needed.
 - 2026-11-14 - Prefer official CubiCasa5K pretrained segmentation for floor-plan counts when its checkout and checkpoint are configured; skip project-specific CNN training and SVG mask generation for that path.
+- 2026-11-14 - IFC counts/quantities in ifc_qa.py: elements assigned to storeys by walking containment/aggregation; a stair is an IfcStair not part of another IfcStair; quantities from authored Qto scaled by project units, geometry volume as fallback - preview ifc_models 1023/1049, all remaining misses need an IFC not in the preview (FZK-Haus) or one room label.
