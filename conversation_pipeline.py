@@ -353,9 +353,17 @@ class ConversationPipeline:
                 from ifc_qa import IfcIndex, answer_ifc_question, answer_ifc_text_question
                 if entry.ifc_index is None:
                     entry.ifc_index = IfcIndex(str(entry.path))
-                result = answer_ifc_question(question, entry.ifc_index)
-                if result.get("status") == "unsupported":
+                text_first = intent == "text" or (
+                    intent == "count" and any(term in question.casefold() for term in ("type", "types", "breakdown", "distribution"))
+                )
+                if text_first:
                     result = answer_ifc_text_question(question, entry.ifc_index)
+                    if result.get("status") == "unsupported":
+                        result = answer_ifc_question(question, entry.ifc_index)
+                else:
+                    result = answer_ifc_question(question, entry.ifc_index)
+                    if result.get("status") == "unsupported":
+                        result = answer_ifc_text_question(question, entry.ifc_index)
         elif entry.format in {"dxf", "dwg"}:
             if intent not in {"area", "count"}:
                 result = {"status": "unsupported", "answer": None,
