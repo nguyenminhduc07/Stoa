@@ -107,8 +107,11 @@ class Router:
 
         model = self._ifc_model(path)
         if model is not None:
-            from ifc_qa import IfcIndex, answer_ifc_question
-            result = answer_ifc_question(question, self._cached("ifc-index", model, IfcIndex))
+            from ifc_qa import IfcIndex, answer_ifc_question, answer_ifc_text_question
+            index = self._cached("ifc-index", model, IfcIndex)
+            result = answer_ifc_question(question, index)
+            if result.get("status") == "unsupported":
+                result = answer_ifc_text_question(question, index)
             if result.get("status") != "unsupported" or kind != "area":
                 return "ifc", result
             from bim_parser import parse_ifc

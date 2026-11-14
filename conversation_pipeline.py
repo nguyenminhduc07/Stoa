@@ -37,6 +37,7 @@ class FileEntry:
     parse_status: str = "not_parsed"
     parse_error: Optional[str] = None
     parsed: Optional[Dict[str, Any]] = field(default=None, repr=False)
+    ifc_index: Any = field(default=None, repr=False)
 
     def public(self, related_ids: Iterable[str] = ()) -> Dict[str, Any]:
         return {
@@ -343,12 +344,16 @@ class ConversationPipeline:
             }
 
         if entry.format == "ifc":
-            if intent != "area":
-                result = {"status": "unsupported", "answer": None,
-                          "reason": "The IFC answerer currently supports area questions.", "evidence": []}
-            else:
+            if intent == "area":
                 from bim_qa import answer_area_question
                 result = answer_area_question(question, document)
+            else:
+                from ifc_qa import IfcIndex, answer_ifc_question, answer_ifc_text_question
+                if entry.ifc_index is None:
+                    entry.ifc_index = IfcIndex(str(entry.path))
+                result = answer_ifc_question(question, entry.ifc_index)
+                if result.get("status") == "unsupported":
+                    result = answer_ifc_text_question(question, entry.ifc_index)
         elif entry.format == "dxf":
             if intent not in {"area", "count"}:
                 result = {"status": "unsupported", "answer": None,
