@@ -7,15 +7,17 @@ class DocumentRouter:
     # CLIP provides useful zero-shot classification without training a model on
     # this dataset. It is loaded only if an image's source does not determine
     # its drawing type.
-    IMAGE_MODEL = "openai/clip-vit-large-patch14"
+    # Base-Patch32 is substantially lighter than Large-Patch14 while still
+    # providing useful zero-shot routing for uploaded architectural drawings.
+    IMAGE_MODEL = "openai/clip-vit-base-patch32"
     IMAGE_LABELS = [
-        "an architectural floor plan viewed from above",
-        "an architectural building elevation drawing",
-        "an architectural building section drawing",
-        "an architectural construction detail drawing",
-        "an architectural site plan",
-        "a map or landscape plan",
-        "a photograph or other image, not a technical drawing",
+        "a technical architectural floor plan drawing from directly above, showing room layouts, walls, doors and windows",
+        "a technical exterior elevation drawing showing the facade of a building",
+        "a technical building section drawing cut vertically through a building",
+        "a close-up construction detail drawing of a building component or assembly",
+        "a technical site plan showing buildings and features on a plot of land",
+        "a map or landscape plan showing roads, terrain or outdoor space",
+        "a photograph or non-technical image, not an architectural drawing",
     ]
     LABEL_TO_TYPE = {
         IMAGE_LABELS[0]: "floor_plan",

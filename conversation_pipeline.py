@@ -148,17 +148,26 @@ class ConversationPipeline:
             from file_classifier import DocumentRouter
 
             if self._vision_classifier is None:
+                # CPU avoids sending CLIP through a possibly unsupported GPU
+                # wheel (the user's V100 needs a build that includes sm_70).
                 self._vision_classifier = pipeline(
-                    task="zero-shot-image-classification", model=DocumentRouter.IMAGE_MODEL
+                    task="zero-shot-image-classification", model=DocumentRouter.IMAGE_MODEL,
+                    device=-1,
                 )
             with Image.open(path) as source:
                 image = source.convert("RGB")
             predictions = self._vision_classifier(image, candidate_labels=DocumentRouter.IMAGE_LABELS)
             if not predictions:
+                self.classification_warnings[file_id] = "Classifier returned no candidate labels."
                 return "uncertain"
             best = predictions[0]
             second = predictions[1]["score"] if len(predictions) > 1 else 0.0
-            if best["score"] < 0.30 or best["score"] - second < 0.05:
+            margin = float(best["score"]) - float(second)
+            if best["score"] < 0.20 or margin < 0.04:
+                self.classification_warnings[file_id] = (
+                    f"Low classifier confidence: {best['label']}={best['score']:.3f}, "
+                    f"runner-up={second:.3f}, margin={margin:.3f}."
+                )
                 return "uncertain"
             return DocumentRouter.LABEL_TO_TYPE.get(best["label"], "uncertain")
         except Exception as exc:
@@ -168,7 +177,11 @@ class ConversationPipeline:
     def _manifest_entry(self, file_id: str) -> Dict[str, Any]:
         entry = self.files[file_id]
         related = [item for item in self._groups.get(entry.group_id, []) if item != file_id]
-        return entry.public(related)
+        result = entry.public(related)
+        warning = self.classification_warnings.get(file_id)
+        if warning:
+            result["classification_warning"] = warning
+        return result
 
     def manifest(self) -> List[Dict[str, Any]]:
         """Return files currently registered in this conversation."""
