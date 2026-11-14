@@ -29,6 +29,9 @@ from typing import Any, Callable, Dict, Optional, Tuple
 
 NUMERIC_TYPES = {"count", "area", "length", "volume"}
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
+TEXT_STOPWORDS = {"a", "an", "and", "are", "as", "at", "by", "for", "from", "in", "including",
+                  "is", "it", "of", "on", "or", "the", "their", "there", "these", "this", "to",
+                  "was", "were", "what", "which", "with", "within", "used", "use", "building", "model"}
 
 
 # --------------------------------------------------------------------------- grading
@@ -67,6 +70,41 @@ def grade(result: Dict[str, Any], row: Dict[str, Any]) -> bool:
             return round(actual) == round(target)
         return abs(actual - target) <= max(abs(target) * 0.02, 0.001)
     return bool(_norm_text(expected)) and _norm_text(expected) in _norm_text(answer)
+
+
+def _f1_overlap(expected: list, actual: list) -> float:
+    from collections import Counter
+    expected_counts, actual_counts = Counter(expected), Counter(actual)
+    overlap = sum((expected_counts & actual_counts).values())
+    if not expected_counts and not actual_counts:
+        return 1.0
+    if overlap == 0:
+        return 0.0
+    precision = overlap / sum(actual_counts.values())
+    recall = overlap / sum(expected_counts.values())
+    return 2 * precision * recall / (precision + recall)
+
+
+def text_similarity(expected: Any, actual: Any) -> Dict[str, float]:
+    """Return a lexical diagnostic for free-form text, not a correctness verdict."""
+    expected_text, actual_text = str(expected or ""), str(actual or "")
+
+    def words(text: str) -> list:
+        value = unicodedata.normalize("NFKD", text.casefold())
+        value = "".join(character for character in value if not unicodedata.combining(character))
+        return [token for token in re.findall(r"[a-z0-9]+", value) if token not in TEXT_STOPWORDS]
+
+    expected_tokens, actual_tokens = words(expected_text), words(actual_text)
+    token_f1 = _f1_overlap(expected_tokens, actual_tokens)
+    number_pattern = r"(?<![A-Za-z])[-+]?\d[\d, .]*(?:\.\d+)?%?"
+    expected_numbers = [number for match in re.findall(number_pattern, expected_text)
+                        if (number := _number(match)) is not None]
+    actual_numbers = [number for match in re.findall(number_pattern, actual_text)
+                      if (number := _number(match)) is not None]
+    numeric_f1 = _f1_overlap([round(number, 3) for number in expected_numbers],
+                             [round(number, 3) for number in actual_numbers])
+    score = 0.7 * token_f1 + 0.3 * numeric_f1 if expected_numbers else token_f1
+    return {"score": score, "token_f1": token_f1, "numeric_f1": numeric_f1}
 
 
 # --------------------------------------------------------------------------- routing
@@ -174,7 +212,10 @@ def evaluate(questions_path: Path, data_dir: Path, *, image_model: Optional[Path
 
     router = Router(data_dir, image_model, cubicasa_repo, cubicasa_weights)
     table: Dict[Tuple[str, str], Counter] = defaultdict(Counter)
+    text_metrics_by_source: Dict[str, list] = defaultdict(list)
     routes, failures = Counter(), []
+    numeric_total = numeric_correct = 0
+    text_exact_matches = 0
     started = time.time()
     for i, row in enumerate(rows, 1):
         source = Path(row["path"]).parts[1] if len(Path(row["path"]).parts) > 1 else "?"
@@ -189,12 +230,28 @@ def evaluate(questions_path: Path, data_dir: Path, *, image_model: Optional[Path
         cell["total"] += 1
         cell["correct"] += ok
         cell["answered"] += result.get("status") == "answered"
+        row_text_metrics = None
+        if row.get("type") in NUMERIC_TYPES:
+            numeric_total += 1
+            numeric_correct += ok
+        elif row.get("type") == "text":
+            actual = result.get("value", result.get("answer"))
+            row_text_metrics = text_similarity(row.get("answer"), actual)
+            text_metrics_by_source[source].append(row_text_metrics)
+            cell["text_similarity_sum"] += row_text_metrics["score"]
+            cell["text_token_f1_sum"] += row_text_metrics["token_f1"]
+            cell["text_numeric_f1_sum"] += row_text_metrics["numeric_f1"]
+            cell["text_scored"] += 1
+            text_exact_matches += ok
         routes[f"{source} -> {route}"] += 1
         if not ok:
-            failures.append({"path": row["path"], "type": row.get("type"), "question": row["question"],
+            failure = {"path": row["path"], "type": row.get("type"), "question": row["question"],
                              "expected": row.get("answer"), "status": result.get("status"),
                              "actual": result.get("value", result.get("answer")),
-                             "reason": result.get("reason") or result.get("method")})
+                             "reason": result.get("reason") or result.get("method")}
+            if row_text_metrics is not None:
+                failure["text_similarity"] = row_text_metrics
+            failures.append(failure)
         if verbose and i % 500 == 0:
             print(f"  {i}/{len(rows)} questions, {time.time() - started:.0f}s", flush=True)
 
@@ -206,6 +263,21 @@ def evaluate(questions_path: Path, data_dir: Path, *, image_model: Optional[Path
         "correct": totals["correct"],
         "answered": totals["answered"],
         "accuracy": round(totals["correct"] / max(1, len(rows)), 4),
+        "strict_exact_correct": totals["correct"],
+        "numeric_questions": numeric_total,
+        "numeric_correct": numeric_correct,
+        "numeric_accuracy": round(numeric_correct / max(1, numeric_total), 4),
+        "text_questions": sum(len(items) for items in text_metrics_by_source.values()),
+        "text_exact_matches": text_exact_matches,
+        "text_quality_by_source": {
+            source: {
+                "count": len(items),
+                "mean_overlap_f1": round(sum(item["score"] for item in items) / len(items), 4),
+                "mean_token_f1": round(sum(item["token_f1"] for item in items) / len(items), 4),
+                "mean_numeric_f1": round(sum(item["numeric_f1"] for item in items) / len(items), 4),
+            }
+            for source, items in sorted(text_metrics_by_source.items())
+        },
         "seconds": round(time.time() - started, 1),
         "by_source_type": {f"{s}/{t}": dict(c) for (s, t), c in sorted(table.items())},
         "routes": dict(routes),
@@ -227,12 +299,29 @@ def _holdout_rows(rows, questions_path: Path, data_dir: Path):
 
 
 def print_report(report: Dict[str, Any]) -> None:
-    print(f"\nOverall: {report['correct']}/{report['questions']} correct "
-          f"({100 * report['accuracy']:.1f}%), {report['answered']} answered, {report['seconds']}s\n")
-    print(f"{'source/type':38} {'correct':>8} {'answered':>9} {'total':>7}   acc")
+    print(f"\nStrict exact/tolerance score: {report['strict_exact_correct']}/{report['questions']} "
+          f"({100 * report['accuracy']:.1f}%), {report['answered']} answered, {report['seconds']}s")
+    if report.get("numeric_questions"):
+        print(f"Numeric accuracy: {report['numeric_correct']}/{report['numeric_questions']} "
+              f"({100 * report['numeric_accuracy']:.1f}%)")
+    if report.get("text_questions"):
+        exact_rate = 100 * report["text_exact_matches"] / report["text_questions"]
+        print(f"Free-text exact matches: {report['text_exact_matches']}/{report['text_questions']} ({exact_rate:.1f}%)")
+        for source, quality in report["text_quality_by_source"].items():
+            print(f"  {source}: lexical/numeric overlap F1 {quality['mean_overlap_f1']:.3f} "
+                  f"(token {quality['mean_token_f1']:.3f}, numbers {quality['mean_numeric_f1']:.3f})")
+        print("  Text overlap is a diagnostic proxy, not a semantic correctness verdict.\n")
+    else:
+        print()
+    print(f"{'source/type':38} {'strict':>8} {'answered':>9} {'total':>7}   score")
     for key, cell in report["by_source_type"].items():
-        acc = 100 * cell.get("correct", 0) / max(1, cell["total"])
-        print(f"{key:38} {cell.get('correct', 0):>8} {cell.get('answered', 0):>9} {cell['total']:>7}  {acc:5.1f}%")
+        if cell.get("text_scored"):
+            score = cell["text_similarity_sum"] / cell["text_scored"]
+            label = f"F1 {score:0.3f}"
+        else:
+            score = 100 * cell.get("correct", 0) / max(1, cell["total"])
+            label = f"{score:5.1f}%"
+        print(f"{key:38} {cell.get('correct', 0):>8} {cell.get('answered', 0):>9} {cell['total']:>7}  {label}")
 
 
 if __name__ == "__main__":

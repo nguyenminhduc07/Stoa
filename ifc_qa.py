@@ -298,11 +298,55 @@ def _space_area(index: IfcIndex, element: Any, *, gross: bool = False) -> Option
 
 
 def _width(index: IfcIndex, element: Any) -> Optional[float]:
+    for name in ("OverallWidth", "ClearWidth", "NominalWidth", "Width"):
+        raw = getattr(element, name, None)
+        if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+            return float(raw) * index.scale.get("LENGTHUNIT", 1.0)
     value = _prop_value(index, element, ("OverallWidth", "ClearWidth", "NominalWidth", "Width"), "LENGTHUNIT")
     if value is not None:
         return value
     value, _method = index.quantity(element, "Width", "LENGTHUNIT")
     return value
+
+
+def _window_area_summary(index: IfcIndex, question: str) -> Optional[Dict[str, Any]]:
+    q = _norm(question)
+    if "window" not in q and "glazed" not in q:
+        return None
+    if "area" not in q and "glazed" not in q:
+        return None
+    windows = list(index.model.by_type("IfcWindow"))
+    if not windows:
+        return _not_found("No IfcWindow elements are defined in the model.")
+    values, estimated = [], False
+    for window in windows:
+        area = _prop_value(index, window, ("Area", "GrossArea", "OverallArea"), "AREAUNIT")
+        if area is None and "estimated" in q:
+            width = _width(index, window)
+            height = None
+            for attr in ("OverallHeight", "Height"):
+                raw = getattr(window, attr, None)
+                if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+                    height = float(raw) * index.scale.get("LENGTHUNIT", 1.0)
+                    break
+            if height is None:
+                height = _prop_value(index, window, ("OverallHeight", "Height"), "LENGTHUNIT")
+            if width is not None and height is not None:
+                area = width * height
+                estimated = True
+        if area is not None:
+            values.append((window, area))
+    if not values:
+        return _not_found("No authored window area or complete width/height dimensions were found.")
+    total = sum(area for _, area in values)
+    coverage = f"for {len(values)} of {len(windows)} windows"
+    if estimated:
+        lead = f"Estimated gross window opening area (OverallWidth x OverallHeight): {total:.2f} m2 {coverage}. This is not net glass area."
+        method = "estimated from authored IFC window overall dimensions"
+    else:
+        lead = f"Total authored window area: {total:.2f} m2 {coverage}."
+        method = "sum of authored IFC window area properties"
+    return _text_answer(index, lead, method, [window for window, _ in values])
 
 
 def _text_evidence(index: IfcIndex, elements: Sequence[Any], **extra: Any) -> List[Dict[str, Any]]:
@@ -775,6 +819,8 @@ def _generic_property_answer(index: IfcIndex, question: str) -> Optional[Dict[st
         requested = ["maintenance requirement", "maintenance interval"]
     elif "warranty" in q or "lifespan" in q or "expected life" in q:
         requested = ["warranty period", "service life", "expected life"]
+    elif "depth" in q or "foundation" in q:
+        requested = ["depth", "foundation depth", "embedment"]
     elif "air tightness" in q or "airtightness" in q:
         requested = ["air tightness", "airtightness"]
     elif "solar heat gain" in q or "shgc" in q:
@@ -797,6 +843,13 @@ def _generic_property_answer(index: IfcIndex, question: str) -> Optional[Dict[st
         elements = list(index.model.by_type("IfcDoor"))
     elif "window" in q or "glazing" in q:
         elements = list(index.model.by_type("IfcWindow"))
+    elif "foundation" in q:
+        elements = []
+        for cls in ("IfcFooting", "IfcPile", "IfcSlab"):
+            try:
+                elements.extend(index.model.by_type(cls))
+            except RuntimeError:
+                pass
     elif "wall" in q or "insulation" in q or "thermal" in q:
         elements = list(index.model.by_type("IfcWall")) + list(index.model.by_type("IfcWallStandardCase"))
     elif "room" in q or "space" in q or "ceiling" in q:
@@ -975,7 +1028,7 @@ def _mep_summary(index: IfcIndex, question: str) -> Optional[Dict[str, Any]]:
 
 def _load_bearing_answer(index: IfcIndex, question: str) -> Optional[Dict[str, Any]]:
     q = _norm(question)
-    if not any(term in q for term in ("load bearing", "loadbearing", "load-bearing")):
+    if not any(term in q for term in ("load bearing", "loadbearing", "load-bearing", "main structural wall", "main structural walls")):
         return None
     walls = list(index.model.by_type("IfcWall"))
     if not walls:
@@ -1055,6 +1108,97 @@ def _ceiling_material_summary(index: IfcIndex, question: str) -> Optional[Dict[s
                         "material layer associations on IfcCovering and IfcSlab", cited[:100])
 
 
+def _covering_detail(index: IfcIndex, question: str) -> Optional[Dict[str, Any]]:
+    q = _norm(question)
+    if not any(term in q for term in ("vapor barrier", "vapour barrier", "skirting", "skirting board")):
+        return None
+    coverings = index.elements("coverings")
+    target_terms = ("vapor barrier", "vapour barrier", "vapourbarrier", "vaporbarrier", "membrane") if "barrier" in q else ("skirting", "skirtingboard", "baseboard")
+    selected = [element for element in coverings
+                if any(term.replace(" ", "") in _norm(" ".join(str(value or "") for value in (
+                    _type_name(element), getattr(element, "Name", None), getattr(element, "PredefinedType", None)))).replace("_", "").replace(" ", "")
+                       for term in target_terms)]
+    if not selected:
+        return _text_answer(index, f"No IfcCovering elements matching {('vapor barrier' if 'barrier' in q else 'skirting board')} are authored in the model.",
+                            "IfcCovering type/name/predefined-type search", coverings)
+    groups: Dict[str, List[Any]] = {}
+    for item in selected:
+        groups.setdefault(_type_name(item), []).append(item)
+    rows = [f"{name}: {len(items)} elements" for name, items in sorted(groups.items())]
+    if "length" in q:
+        values = [(item, _prop_value(index, item, ("Length", "NetLength", "GrossLength"), "LENGTHUNIT")) for item in selected]
+        known = [(item, value) for item, value in values if value is not None]
+        if len(known) == len(selected):
+            rows.append(f"Total authored length: {sum(value for _, value in known):.2f} m")
+        else:
+            rows.append(f"Length is authored for {len(known)} of {len(selected)} matching elements; total withheld.")
+    return _text_answer(index, "Matching covering elements:\n" + "\n".join(rows),
+                        "IfcCovering names, types and authored quantities", selected)
+
+
+def _office_space_summary(index: IfcIndex, question: str) -> Optional[Dict[str, Any]]:
+    q = _norm(question)
+    if "office" not in q and "buero" not in q:
+        return None
+    if not any(term in q for term in ("space", "room", "office")):
+        return None
+    spaces = [space for space in index.model.by_type("IfcSpace")
+              if any(term in _norm(_named(space)) for term in ("office", "buero", "bureau", "kontor"))]
+    if not spaces:
+        return _not_found("No office-type IfcSpace names or room labels were found.")
+    groups: Dict[str, List[Any]] = {}
+    for space in spaces:
+        groups.setdefault(_named(space), []).append(space)
+    rows = [f"{name}: {len(items)} spaces" for name, items in sorted(groups.items())]
+    return _text_answer(index, f"Office-type spaces identified by authored space names: {len(spaces)}\n" + "\n".join(rows),
+                        "IfcSpace Name/LongName matching office terms", spaces)
+
+
+def _bathroom_tiling_summary(index: IfcIndex, question: str) -> Optional[Dict[str, Any]]:
+    q = _norm(question)
+    if not ("bathroom" in q and any(term in q for term in ("tile", "tiling", "flooring"))):
+        return None
+    spaces = [space for space in index.model.by_type("IfcSpace")
+              if any(term in _norm(_named(space)) for term in ("bath", "wc", "shower"))]
+    tile_coverings = []
+    for covering in index.elements("coverings"):
+        labels = _norm(" ".join(str(value or "") for value in (
+            _type_name(covering), getattr(covering, "Name", None), getattr(covering, "PredefinedType", None))))
+        materials = _norm(" ".join(name for name, _thickness in _materials(covering)))
+        if "tile" in labels or "tile" in materials or "ceramic" in labels or "ceramic" in materials:
+            tile_coverings.append(covering)
+    if not spaces or not tile_coverings:
+        return _not_found("Bathroom IfcSpace labels or tile/ceramic IfcCovering elements are not sufficiently authored to calculate tiled area.")
+    rel_class = "IfcRelCoversSpaces"
+    try:
+        relations = index.model.by_type(rel_class)
+    except RuntimeError:
+        relations = []
+    associations = []
+    for relation in relations:
+        space = getattr(relation, "RelatingSpace", None)
+        if space not in spaces:
+            continue
+        for covering in getattr(relation, "RelatedCoverings", None) or []:
+            if covering in tile_coverings:
+                associations.append((space, covering))
+    if not associations:
+        return _not_found("Tile coverings were found, but the IFC model does not associate them with bathroom spaces.")
+    by_room: Dict[int, Tuple[Any, List[Any]]] = {}
+    for space, covering in associations:
+        by_room.setdefault(space.id(), (space, []))[1].append(covering)
+    rows, cited = [], []
+    for space, coverings in by_room.values():
+        areas = [_prop_value(index, covering, ("NetArea", "GrossArea", "Area"), "AREAUNIT") for covering in coverings]
+        if any(area is None for area in areas):
+            rows.append(f"{_named(space)}: {len(coverings)} tile coverings; area not authored")
+        else:
+            rows.append(f"{_named(space)}: {sum(area for area in areas if area is not None):.2f} m2")
+        cited.extend([space, *coverings])
+    return _text_answer(index, "Authored bathroom tile coverings by space:\n" + "\n".join(rows),
+                        "IfcRelCoversSpaces associations and covering area quantities", cited)
+
+
 def answer_ifc_text_question(question: str, index: IfcIndex) -> Dict[str, Any]:
     """Answer common IFC-Bench text questions from authored IFC semantics only."""
     q = _norm(question)
@@ -1064,6 +1208,9 @@ def answer_ifc_text_question(question: str, index: IfcIndex) -> Dict[str, Any]:
     scale = _building_scale(index, question)
     if scale is not None:
         return scale
+    window_area = _window_area_summary(index, question)
+    if window_area is not None:
+        return window_area
     if any(term in q for term in ("floor to floor", "floor-to-floor", "heights of each level", "elevations of the building levels", "elevation of the building levels", "level elevations")):
         return _level_heights(index) or _not_found("Storey elevations are insufficient to compute floor-to-floor heights.")
     ceiling = _ceiling_summary(index, question)
@@ -1072,6 +1219,15 @@ def answer_ifc_text_question(question: str, index: IfcIndex) -> Dict[str, Any]:
     ceiling_materials = _ceiling_material_summary(index, question)
     if ceiling_materials is not None:
         return ceiling_materials
+    covering_detail = _covering_detail(index, question)
+    if covering_detail is not None:
+        return covering_detail
+    bathroom_tiling = _bathroom_tiling_summary(index, question)
+    if bathroom_tiling is not None:
+        return bathroom_tiling
+    office_spaces = _office_space_summary(index, question)
+    if office_spaces is not None:
+        return office_spaces
     load_bearing = _load_bearing_answer(index, question)
     if load_bearing is not None:
         return load_bearing
