@@ -113,7 +113,7 @@ class DocumentRouter:
         pipeline = transformers.pipeline
         self._image_classifier = (
             "pipeline",
-            pipeline(task="zero-shot-image-classification", model=self.IMAGE_MODEL),
+            pipeline(task="zero-shot-image-classification", model=self.IMAGE_MODEL, device=-1),
         )
         return self._image_classifier
 

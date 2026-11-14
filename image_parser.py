@@ -38,6 +38,7 @@ _OBJECT_DETECTOR_CACHE: Dict[str, Any] = {}
 _CUBICASA_DOWNLOAD_LOCK = threading.Lock()
 _CUBICASA_DOWNLOAD_ATTEMPTED = False
 _CUBICASA_GDRIVE_FILE_ID = "1gRB7ez1e4H7a9Y09lLqRuna0luZO5VRK"
+_TORCH_CUDA_USABLE: Optional[bool] = None
 _RAPID_OCR = None
 _DIMENSION_PATTERN = re.compile(
     r"(?<![A-Za-z0-9])(?:\d{1,3}(?:[ ,]\d{3})+|\d+)(?:[.,]\d+)?\s*(?:mm|cm|ft|feet|inches|inch|in|m)(?![A-Za-z])",
@@ -54,6 +55,55 @@ def _read_setting(name: str) -> Optional[str]:
         return get_env_setting(name)
     except Exception:
         return None
+
+
+def _select_torch_device():
+    """Return a verified PyTorch execution device, falling back to CPU on incompatible GPUs."""
+    global _TORCH_CUDA_USABLE
+    torch = require_torch()
+    forced = (_read_setting("STOA_TORCH_DEVICE") or "").strip().lower()
+    if forced == "cpu":
+        return torch.device("cpu")
+    if forced.startswith("cuda"):
+        return torch.device(forced)
+
+    if _TORCH_CUDA_USABLE is False:
+        return torch.device("cpu")
+    if _TORCH_CUDA_USABLE is True:
+        return torch.device("cuda")
+
+    if not torch.cuda.is_available():
+        _TORCH_CUDA_USABLE = False
+        return torch.device("cpu")
+
+    try:
+        major, minor = torch.cuda.get_device_capability(0)
+        sm_target = major * 10 + minor
+        arch_list = [str(a).lower() for a in (torch.cuda.get_arch_list() or [])]
+        if arch_list:
+            exact_ok = any(a.startswith(f"sm_{sm_target}") for a in arch_list)
+            ptx_nums = [
+                int(m.group(1))
+                for a in arch_list
+                if (m := re.match(r"compute_(\d+)", a))
+            ]
+            ptx_ok = any(p <= sm_target for p in ptx_nums)
+            if not exact_ok and not ptx_ok:
+                _TORCH_CUDA_USABLE = False
+                return torch.device("cpu")
+
+        # Smoke-test actual Conv2d + ConvTranspose2d + BatchNorm2d kernel execution on the GPU
+        with torch.no_grad():
+            probe = torch.zeros((1, 3, 8, 8), device="cuda")
+            conv = torch.nn.Conv2d(3, 4, kernel_size=3, padding=1).to("cuda").eval()
+            bn = torch.nn.BatchNorm2d(4).to("cuda").eval()
+            up = torch.nn.ConvTranspose2d(4, 2, kernel_size=2, stride=2).to("cuda").eval()
+            _ = float(up(bn(conv(probe))).sum().cpu().item())
+        _TORCH_CUDA_USABLE = True
+        return torch.device("cuda")
+    except Exception:
+        _TORCH_CUDA_USABLE = False
+        return torch.device("cpu")
 
 
 def _auto_download_cubicasa_weights(target_path: Path) -> Optional[Path]:
@@ -404,25 +454,32 @@ def _load_count_model(checkpoint_path: str | Path):
         return _COUNT_MODEL_CACHE[key]
     if not path.is_file():
         raise FileNotFoundError(f"Floor-plan model checkpoint not found: {path}")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = _select_torch_device()
     try:
-        checkpoint = torch.load(path, map_location=device, weights_only=True)
+        checkpoint = torch.load(path, map_location="cpu", weights_only=True)
     except TypeError:  # PyTorch versions before weights_only was introduced.
-        checkpoint = torch.load(path, map_location=device)
+        checkpoint = torch.load(path, map_location="cpu")
     if checkpoint.get("model_version") != MODEL_VERSION:
         raise ValueError(f"Unsupported floor-plan model version: {checkpoint.get('model_version')}")
     categories = checkpoint.get("categories", [])
     if tuple(categories) != CATEGORY_NAMES:
         raise ValueError("Checkpoint count categories do not match this parser version")
-    model = SharedFloorplanCounter(categories).to(device)
+    model = SharedFloorplanCounter(categories)
     model.load_state_dict(checkpoint["state_dict"])
-    model.eval()
+    try:
+        model = model.to(device).eval()
+    except Exception:
+        device = torch.device("cpu")
+        model = SharedFloorplanCounter(categories)
+        model.load_state_dict(checkpoint["state_dict"])
+        model.eval()
     cached = (model, checkpoint, device)
     _COUNT_MODEL_CACHE[key] = cached
     return cached
 
 
 def _count_prediction(image_path: str | Path, checkpoint_path: str | Path, category: str) -> Tuple[int, Dict[str, Any]]:
+    global _TORCH_CUDA_USABLE
     torch = require_torch()
     try:
         from PIL import Image, ImageOps
@@ -439,7 +496,18 @@ def _count_prediction(image_path: str | Path, checkpoint_path: str | Path, categ
         pixels = torch.frombuffer(bytearray(canvas.tobytes()), dtype=torch.uint8)
         tensor = pixels.reshape(image_size, image_size, 3).permute(2, 0, 1).float().div(127.5).sub(1.0)
     with torch.no_grad():
-        prediction = model(tensor.unsqueeze(0).to(device))[category].item()
+        try:
+            prediction = model(tensor.unsqueeze(0).to(device))[category].item()
+        except Exception:
+            if device.type != "cuda":
+                raise
+            _TORCH_CUDA_USABLE = False
+            cpu_device = torch.device("cpu")
+            cpu_model = SharedFloorplanCounter(checkpoint["categories"])
+            cpu_model.load_state_dict(checkpoint["state_dict"])
+            cpu_model.eval()
+            _COUNT_MODEL_CACHE[str(Path(checkpoint_path).resolve())] = (cpu_model, checkpoint, cpu_device)
+            prediction = cpu_model(tensor.unsqueeze(0))[category].item()
     count = max(0, int(round(math.expm1(max(0.0, prediction)))))
     mae = checkpoint.get("validation_mae_counts", {}).get(category)
     return count, {
@@ -457,20 +525,26 @@ def _load_geometry_model(checkpoint_path: str | Path):
         return _GEOMETRY_MODEL_CACHE[key]
     if not path.is_file():
         raise FileNotFoundError(f"Geometry model checkpoint not found: {path}")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = _select_torch_device()
     try:
-        checkpoint = torch.load(path, map_location=device, weights_only=True)
+        checkpoint = torch.load(path, map_location="cpu", weights_only=True)
     except TypeError:
-        checkpoint = torch.load(path, map_location=device)
+        checkpoint = torch.load(path, map_location="cpu")
     if checkpoint.get("model_version") != GEOMETRY_MODEL_VERSION:
         raise ValueError(f"Unsupported geometry model version: {checkpoint.get('model_version')}")
     if tuple(checkpoint.get("rooms", [])) != ROOM_CLASSES or tuple(checkpoint.get("icons", [])) != ICON_CLASSES:
         raise ValueError("Geometry checkpoint class mapping does not match this parser")
     if tuple(checkpoint.get("count_categories", [])) != CATEGORY_NAMES:
         raise ValueError("Geometry checkpoint count heads do not match this parser")
-    model = FloorplanGeometryNet().to(device)
+    model = FloorplanGeometryNet()
     model.load_state_dict(checkpoint["state_dict"])
-    model.eval()
+    try:
+        model = model.to(device).eval()
+    except Exception:
+        device = torch.device("cpu")
+        model = FloorplanGeometryNet()
+        model.load_state_dict(checkpoint["state_dict"])
+        model.eval()
     cached = (model, checkpoint, device)
     _GEOMETRY_MODEL_CACHE[key] = cached
     return cached
@@ -547,7 +621,19 @@ def _geometry_prediction(
         tensor = data.reshape(size, size, 3).permute(2, 0, 1).float().div(127.5).sub(1.0)
 
     with torch.no_grad():
-        outputs = model(tensor.unsqueeze(0).to(device))
+        try:
+            outputs = model(tensor.unsqueeze(0).to(device))
+        except Exception:
+            global _TORCH_CUDA_USABLE
+            if device.type != "cuda":
+                raise
+            _TORCH_CUDA_USABLE = False
+            cpu_device = torch.device("cpu")
+            cpu_model = FloorplanGeometryNet()
+            cpu_model.load_state_dict(checkpoint["state_dict"])
+            cpu_model.eval()
+            _GEOMETRY_MODEL_CACHE[str(Path(checkpoint_path).resolve())] = (cpu_model, checkpoint, cpu_device)
+            outputs = cpu_model(tensor.unsqueeze(0))
         room_prob = torch.softmax(outputs["rooms"][0], dim=0).cpu().numpy()
         icon_prob = torch.softmax(outputs["icons"][0], dim=0).cpu().numpy()
         count_log = outputs["count_log1p"][0].cpu().numpy()
@@ -617,24 +703,31 @@ def _load_cubicasa_model(repo_path: str | Path | None, weights_path: str | Path)
     if key in _CUBICASA_MODEL_CACHE:
         return _CUBICASA_MODEL_CACHE[key]
 
-    if repo_key != "__builtin__" and repo is not None:
-        repo_text = str(repo)
-        if repo_text not in sys.path:
-            sys.path.insert(0, repo_text)
-        from floortrans.models.hg_furukawa_original import hg_furukawa_original
-        model = hg_furukawa_original(44)
-    else:
-        model = FurukawaHourglass(44)
+    def _instantiate_arch():
+        if repo_key != "__builtin__" and repo is not None:
+            repo_text = str(repo)
+            if repo_text not in sys.path:
+                sys.path.insert(0, repo_text)
+            from floortrans.models.hg_furukawa_original import hg_furukawa_original
+            return hg_furukawa_original(44)
+        return FurukawaHourglass(44)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = _select_torch_device()
     try:
-        checkpoint = torch.load(weights, map_location=device, weights_only=True)
+        checkpoint = torch.load(weights, map_location="cpu", weights_only=True)
     except TypeError:
-        checkpoint = torch.load(weights, map_location=device)
+        checkpoint = torch.load(weights, map_location="cpu")
     if not isinstance(checkpoint, dict) or "model_state" not in checkpoint:
         raise ValueError("Expected the official CubiCasa checkpoint with a 'model_state' entry")
+    model = _instantiate_arch()
     model.load_state_dict(checkpoint["model_state"])
-    model.to(device).eval()
+    try:
+        model = model.to(device).eval()
+    except Exception:
+        device = torch.device("cpu")
+        model = _instantiate_arch()
+        model.load_state_dict(checkpoint["model_state"])
+        model.eval()
     loaded = (model, device, checkpoint)
     _CUBICASA_MODEL_CACHE[key] = loaded
     return loaded
@@ -642,6 +735,7 @@ def _load_cubicasa_model(repo_path: str | Path | None, weights_path: str | Path)
 
 def _cubicasa_prediction(image_path: str | Path, repo_path: str | Path | None, weights_path: str | Path):
     """Run official 44-channel CubiCasa inference and return localized classes."""
+    global _TORCH_CUDA_USABLE
     torch = require_torch()
     import numpy as np
     try:
@@ -657,7 +751,7 @@ def _cubicasa_prediction(image_path: str | Path, repo_path: str | Path | None, w
     if key in _CUBICASA_PREDICTION_CACHE:
         return _CUBICASA_PREDICTION_CACHE[key]
 
-    model, device, _checkpoint = _load_cubicasa_model(repo_path, weights)
+    model, device, checkpoint = _load_cubicasa_model(repo_path, weights)
     with Image.open(image_path) as source_image:
         image = ImageOps.exif_transpose(source_image).convert("RGB")
         original_width, original_height = image.size
@@ -674,7 +768,23 @@ def _cubicasa_prediction(image_path: str | Path, repo_path: str | Path | None, w
         tensor = tensor.reshape(input_height, input_width, 3).permute(2, 0, 1).float().div(127.5).sub(1.0)
 
     with torch.no_grad():
-        outputs = model(tensor.unsqueeze(0).to(device))[0]
+        try:
+            outputs = model(tensor.unsqueeze(0).to(device))[0]
+        except Exception:
+            if device.type != "cuda":
+                raise
+            _TORCH_CUDA_USABLE = False
+            cpu_device = torch.device("cpu")
+            cpu_model = FurukawaHourglass(44)
+            cpu_model.load_state_dict(checkpoint["model_state"])
+            cpu_model.eval()
+            cache_repo_key = (
+                str(Path(repo_path).expanduser().resolve())
+                if (repo_path and (Path(repo_path).expanduser().resolve() / "floortrans" / "models" / "hg_furukawa_original.py").is_file())
+                else "__builtin__"
+            )
+            _CUBICASA_MODEL_CACHE[(cache_repo_key, weights)] = (cpu_model, cpu_device, checkpoint)
+            outputs = cpu_model(tensor.unsqueeze(0))[0]
         room_prob = torch.softmax(outputs[21:33], dim=0).cpu().numpy()
         icon_prob = torch.softmax(outputs[33:44], dim=0).cpu().numpy()
 
@@ -1202,7 +1312,7 @@ def _answer_raster_object_count(
         detector = _OBJECT_DETECTOR_CACHE.get(model_key)
         if detector is None:
             from transformers import pipeline
-            device = 0 if require_torch().cuda.is_available() else -1
+            device = 0 if _select_torch_device().type == "cuda" else -1
             detector = pipeline("zero-shot-object-detection", model=model_key, device=device)
             _OBJECT_DETECTOR_CACHE[model_key] = detector
         from PIL import Image
