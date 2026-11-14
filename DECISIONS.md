@@ -6,3 +6,4 @@
 - 2026-11-14 - Fixture rules: rounded-rect basin >=1.2 m = bathtub; elliptical bowl with drain circle = washbasin, without = toilet; rectangular tray with drain = shower - consistent drawing convention, 1614/1614 counts on preview.
 - 2026-11-14 - Unnamed numbered rooms are included in apartment/floor totals - source room type is not drawn; accounts for the remaining 20/744 area misses.
 - 2026-11-14 - Uploaded-file parsing and cache are scoped to a conversation instance and lazy-loaded; this avoids persistent storage while isolating chats.
+- 2026-11-14 - Chat API keeps conversation state in process and on local temporary storage; use one server worker and close sessions to clear files - avoids introducing a database before persistence is needed.

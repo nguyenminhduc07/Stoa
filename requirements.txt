@@ -9,3 +9,7 @@ svgpathtools
 # transformers
 # Install torch from the PyTorch selector with the desired CUDA build; a plain
 # pip install can replace it with a CPU-only build.
+
+fastapi
+python-multipart
+uvicorn[standard]
