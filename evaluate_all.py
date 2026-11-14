@@ -57,13 +57,28 @@ def _number(value: Any) -> Optional[float]:
         return None
 
 
+def _area_number(value: Any) -> Optional[float]:
+    """Prefer an explicit summary total over floor or room-count numbers."""
+    if isinstance(value, str):
+        total = re.search(
+            r"\btotal(?:\s+at\s+least)?\s*(?:area\s*)?[:=]?\s*"
+            r"(-?\d[\d\s,]*(?:\.\d+)?)",
+            value,
+            re.IGNORECASE,
+        )
+        if total:
+            return _number(total.group(1))
+    return _number(value)
+
+
 def grade(result: Dict[str, Any], row: Dict[str, Any]) -> bool:
     if result.get("status") != "answered":
         return False
     answer = result.get("value", result.get("answer"))
     expected, kind = row.get("answer"), row.get("type")
     if kind in NUMERIC_TYPES:
-        actual, target = _number(answer), _number(expected)
+        actual = _area_number(answer) if kind == "area" else _number(answer)
+        target = _number(expected)
         if actual is None or target is None:
             return False
         if kind == "count":
