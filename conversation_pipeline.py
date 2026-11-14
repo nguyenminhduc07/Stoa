@@ -280,8 +280,8 @@ class ConversationPipeline:
                     from cad_qa import build_floor_index
                     parsed = build_floor_index(entry.path)
                 elif entry.format == "dwg":
-                    from cad_parser import parse_dwg
-                    parsed = parse_dwg(entry.path)
+                    from cad_qa import build_floor_index
+                    parsed = build_floor_index(entry.path)
                 elif entry.format == "pdf":
                     from pdf_parser import parse_pdf
                     parsed = parse_pdf(entry.path)
@@ -354,17 +354,13 @@ class ConversationPipeline:
                 result = answer_ifc_question(question, entry.ifc_index)
                 if result.get("status") == "unsupported":
                     result = answer_ifc_text_question(question, entry.ifc_index)
-        elif entry.format == "dxf":
+        elif entry.format in {"dxf", "dwg"}:
             if intent not in {"area", "count"}:
                 result = {"status": "unsupported", "answer": None,
-                          "reason": "The DXF answerer currently supports count and area questions.", "evidence": []}
+                          "reason": "The CAD answerer currently supports count and area questions.", "evidence": []}
             else:
                 from cad_qa import answer_cad_question
                 result = answer_cad_question(question, document)
-        elif entry.format == "dwg":
-            result = {"status": "unsupported", "answer": None,
-                      "reason": "DWG parsing is available, but a DWG question answerer is not implemented yet.",
-                      "evidence": []}
         elif entry.format == "pdf":
             from pdf_parser import answer_pdf_question
             result = answer_pdf_question(question, document)

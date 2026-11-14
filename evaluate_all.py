@@ -122,6 +122,10 @@ class Router:
         if dxf.exists():
             from cad_qa import answer_cad_question, build_floor_index
             return "dxf", answer_cad_question(question, self._cached("dxf", dxf, build_floor_index))
+        dwg = path.with_suffix(".dwg")
+        if dwg.exists():
+            from cad_qa import answer_cad_question, build_floor_index
+            return "dwg", answer_cad_question(question, self._cached("dwg", dwg, build_floor_index))
 
         if not path.exists():
             return "missing", {"status": "missing_file", "reason": f"{path} not found"}

@@ -149,7 +149,18 @@ def build_floor_index(file_path: str | Path) -> Dict[str, Any]:
     except ImportError as exc:
         raise RuntimeError("DXF parsing requires ezdxf. Install it with: pip install ezdxf") from exc
     path = Path(file_path).resolve()
-    msp = ezdxf.readfile(path).modelspace()
+    if path.suffix.casefold() == ".dwg":
+        try:
+            from ezdxf.addons import odafc
+            drawing = odafc.readfile(path)
+        except Exception as exc:
+            raise RuntimeError(
+                "DWG question answering requires the ODA File Converter and ezdxf's odafc add-on. "
+                f"Conversion failed: {exc}"
+            ) from exc
+    else:
+        drawing = ezdxf.readfile(path)
+    msp = drawing.modelspace()
 
     by_layer: Dict[str, List[Tuple[Any, List[Point]]]] = {}
     for entity in msp:
@@ -222,7 +233,7 @@ def build_floor_index(file_path: str | Path) -> Dict[str, Any]:
               and (f["bbox"] != g["bbox"] or f["handle"] > g["handle"])}
     fixtures = [f for f in fixtures if id(f) not in nested]
 
-    return {"source": {"path": str(path), "format": "DXF", "units": "m"},
+    return {"source": {"path": str(path), "format": path.suffix.lstrip(".").upper(), "units": "m"},
             "rooms": rooms, "units": units, "doors": doors, "windows": windows, "fixtures": fixtures}
 
 

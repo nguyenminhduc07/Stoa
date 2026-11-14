@@ -14,3 +14,4 @@
 - 2026-11-14 - Non-floor-plan rasters share RapidOCR line extraction for title-block fields, text lookups, and printed dimensions; do not infer symbol counts or scaled geometry without a dedicated detector or calibration.
 - 2026-11-14 - IFC text questions use authored IFC header, spatial, type, dimensional and property data; return not_found when required quantities/properties are absent rather than estimate.
 - 2026-11-14 - Raster-only PDF pages with fewer than five embedded words and at least one image use shared RapidOCR; OCR coordinates are scaled to page coordinates and symbol counts remain unsupported.
+- 2026-11-14 - DWG count/area questions use ezdxf ODA conversion followed by the existing layer-based CAD answerer; files without supported semantic layers remain unanswerable.
