@@ -26,6 +26,8 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 _DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
 _DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
 _DOTENV_CACHE: Optional[Dict[str, str]] = None
+_DISCOVERED_GEMINI_MODELS: Optional[List[str]] = None
+_WORKING_GEMINI_MODEL: Optional[str] = None
 
 
 def _load_dotenv() -> Dict[str, str]:
@@ -1270,6 +1272,43 @@ _REASONING_OPENAI_SCHEMA = {
 }
 
 
+def _discover_gemini_models(api_key: str) -> List[str]:
+    """Query Google ModelService.ListModels for active generateContent Gemini models."""
+    global _DISCOVERED_GEMINI_MODELS
+    if _DISCOVERED_GEMINI_MODELS is not None:
+        return _DISCOVERED_GEMINI_MODELS
+    url = "https://generativelanguage.googleapis.com/v1beta/models?pageSize=100"
+    req = urllib.request.Request(url, headers={"x-goog-api-key": api_key}, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=15.0) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return []
+
+    usable: List[Tuple[Tuple[int, int, str], str]] = []
+    for item in payload.get("models") or []:
+        methods = item.get("supportedGenerationMethods") or []
+        if "generateContent" not in methods:
+            continue
+        raw_name = str(item.get("name") or "")
+        name = raw_name[len("models/"):] if raw_name.startswith("models/") else raw_name
+        low = name.casefold()
+        if "gemini" not in low:
+            continue
+        if any(skip in low for skip in ("embedding", "tts", "image", "audio", "robotics", "computer-use", "aqa")):
+            continue
+        # Prefer flash models first, then pro, then newest name descending.
+        tier = 0 if "flash" in low and "lite" not in low else (1 if "flash" in low else (2 if "pro" in low else 3))
+        stable = 0 if "exp" not in low and "preview" not in low else 1
+        usable.append(((tier, stable, name), name))
+
+    usable.sort(key=lambda pair: (pair[0][0], pair[0][1], pair[0][2]))
+    discovered = [name for _, name in usable]
+    if discovered:
+        _DISCOVERED_GEMINI_MODELS = discovered
+    return discovered
+
+
 def _call_gemini_reasoner(api_key: str, payload_json: str) -> Dict[str, Any]:
     configured = (get_env_setting("GEMINI_MODEL") or get_env_setting("STOA_LLM_MODEL") or _DEFAULT_GEMINI_MODEL).strip()
     if configured.startswith("models/"):
@@ -1278,11 +1317,11 @@ def _call_gemini_reasoner(api_key: str, payload_json: str) -> Dict[str, Any]:
         configured = _DEFAULT_GEMINI_MODEL
 
     models_to_try = list(dict.fromkeys([
+        *([_WORKING_GEMINI_MODEL] if _WORKING_GEMINI_MODEL else []),
         configured or _DEFAULT_GEMINI_MODEL,
         "gemini-2.5-flash",
         "gemini-2.0-flash",
         "gemini-2.5-flash-lite",
-        "gemini-1.5-flash",
     ]))
 
     body = json.dumps({
@@ -1298,29 +1337,45 @@ def _call_gemini_reasoner(api_key: str, payload_json: str) -> Dict[str, Any]:
 
     data: Optional[Dict[str, Any]] = None
     last_error: Optional[str] = None
-    for model in models_to_try:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{urllib.parse.quote(model, safe='')}:generateContent"
-        req = urllib.request.Request(
-            url,
-            data=body,
-            headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=35.0) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-            break
-        except urllib.error.HTTPError as exc:
-            err_body = ""
-            try:
-                err_body = exc.read().decode("utf-8", errors="ignore").strip()
-            except Exception:
-                pass
-            detail = err_body[:400] if err_body else exc.reason
-            last_error = f"HTTP {exc.code} for model '{model}': {detail}"
-            if exc.code == 404:
+    tried: set[str] = set()
+
+    def _try_models(candidates: List[str]) -> Optional[Dict[str, Any]]:
+        global _WORKING_GEMINI_MODEL
+        nonlocal last_error
+        for model in candidates:
+            if model in tried:
                 continue
-            raise RuntimeError(last_error) from exc
+            tried.add(model)
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{urllib.parse.quote(model, safe='')}:generateContent"
+            req = urllib.request.Request(
+                url,
+                data=body,
+                headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=35.0) as resp:
+                    parsed = json.loads(resp.read().decode("utf-8"))
+                _WORKING_GEMINI_MODEL = model
+                return parsed
+            except urllib.error.HTTPError as exc:
+                err_body = ""
+                try:
+                    err_body = exc.read().decode("utf-8", errors="ignore").strip()
+                except Exception:
+                    pass
+                detail = err_body[:400] if err_body else exc.reason
+                last_error = f"HTTP {exc.code} for model '{model}': {detail}"
+                if exc.code == 404:
+                    continue
+                raise RuntimeError(last_error) from exc
+        return None
+
+    data = _try_models(models_to_try)
+    if data is None:
+        discovered = _discover_gemini_models(api_key)
+        if discovered:
+            data = _try_models(discovered)
 
     if data is None:
         raise RuntimeError(last_error or "All Gemini model endpoints returned 404 Not Found.")
