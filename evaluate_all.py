@@ -74,9 +74,12 @@ def grade(result: Dict[str, Any], row: Dict[str, Any]) -> bool:
 class Router:
     """Picks an answerer per question and caches parsed documents."""
 
-    def __init__(self, data_dir: Path, image_model: Optional[Path] = None):
+    def __init__(self, data_dir: Path, image_model: Optional[Path] = None,
+                 cubicasa_repo: Optional[Path] = None, cubicasa_weights: Optional[Path] = None):
         self.data_dir = data_dir
         self.image_model = image_model
+        self.cubicasa_repo = cubicasa_repo
+        self.cubicasa_weights = cubicasa_weights
         self.cache: Dict[Tuple[str, Path], Any] = {}
         self.ifc_by_stem = {p.stem: p for p in data_dir.rglob("*.ifc")}
 
@@ -131,14 +134,22 @@ class Router:
             if category in SUPPORTED:
                 return "image-ocr", answer_room_question(question, path, category)
             from image_parser import answer_image_question, parse_image
-            document = self._cached("image", path, lambda p: parse_image(p, run_ocr=False))
-            return "image", answer_image_question(question, document, model_path=self.image_model)
+            needs_ocr = row.get("type") == "text" or any(
+                term in question.casefold() for term in ("read", "label", "scale", "title", "drawing number")
+            )
+            document = self._cached("image", path, lambda p: parse_image(p, run_ocr=needs_ocr))
+            return "image", answer_image_question(
+                question, document, model_path=self.image_model,
+                cubicasa_repo_path=self.cubicasa_repo,
+                cubicasa_weights_path=self.cubicasa_weights,
+            )
         return "other", {"status": "unsupported", "reason": f"No answerer for {suffix} files."}
 
 
 # --------------------------------------------------------------------------- evaluation
 
 def evaluate(questions_path: Path, data_dir: Path, *, image_model: Optional[Path] = None,
+             cubicasa_repo: Optional[Path] = None, cubicasa_weights: Optional[Path] = None,
              sources: Optional[set] = None, holdout_only: bool = False, limit: Optional[int] = None,
              verbose: bool = False) -> Dict[str, Any]:
     rows = [json.loads(line) for line in questions_path.read_text(encoding="utf-8").splitlines() if line.strip()]
@@ -149,7 +160,7 @@ def evaluate(questions_path: Path, data_dir: Path, *, image_model: Optional[Path
     if limit:
         rows = rows[:limit]
 
-    router = Router(data_dir, image_model)
+    router = Router(data_dir, image_model, cubicasa_repo, cubicasa_weights)
     table: Dict[Tuple[str, str], Counter] = defaultdict(Counter)
     routes, failures = Counter(), []
     started = time.time()
@@ -216,7 +227,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Route every question to its answerer and score the whole system")
     parser.add_argument("--questions", type=Path, default=Path("junction-dataset-preview/questions.jsonl"))
     parser.add_argument("--data", type=Path, default=Path("junction-dataset-preview/data"))
-    parser.add_argument("--image-model", type=Path, help="Floor-plan CNN checkpoint for image count questions")
+    parser.add_argument("--image-model", type=Path, help="Optional legacy project count-model checkpoint")
+    parser.add_argument("--cubicasa-repo", type=Path, help="Official CubiCasa5K checkout for pretrained raster counts")
+    parser.add_argument("--cubicasa-weights", type=Path, help="Official model_best_val_loss_var.pkl checkpoint")
     parser.add_argument("--holdout-only", action="store_true",
                         help="Score image questions only on the CNN's validation drawings (avoid train leakage)")
     parser.add_argument("--sources", nargs="*", help="Only these data/<source> folders, e.g. swiss_dwellings ifc_models")
@@ -227,6 +240,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     report = evaluate(args.questions, args.data, image_model=args.image_model,
+                      cubicasa_repo=args.cubicasa_repo, cubicasa_weights=args.cubicasa_weights,
                       sources=set(args.sources) if args.sources else None,
                       holdout_only=args.holdout_only, limit=args.limit, verbose=args.verbose)
     failures = report.pop("failures")
