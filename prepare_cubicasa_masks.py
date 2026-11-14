@@ -22,6 +22,18 @@ from floorplan_geometry_model import ICON_CLASSES, ROOM_CLASSES
 Job = Tuple[str, str, str, str]
 
 
+def _is_valid_mask(path: Path) -> bool:
+    """Only skip complete masks with the arrays expected by the trainer."""
+    try:
+        with np.load(path, allow_pickle=False) as data:
+            if not {"rooms", "icons"}.issubset(data.files):
+                return False
+            rooms, icons = data["rooms"], data["icons"]
+            return rooms.ndim == 2 and icons.ndim == 2 and rooms.shape == icons.shape
+    except Exception:
+        return False
+
+
 def _convert_one(job: Job) -> Tuple[str, str]:
     repo_text, dataset_text, output_text, svg_text = job
     repo, dataset, output, svg_path = map(Path, (repo_text, dataset_text, output_text, svg_text))
@@ -92,7 +104,7 @@ def prepare_masks(
             failures.append(f"no F1_original.png or F1_scaled.png beside {svg_path}")
             continue
         target = (output / image_path.relative_to(dataset)).with_suffix(".npz")
-        if target.is_file() and not overwrite:
+        if target.is_file() and not overwrite and _is_valid_mask(target):
             skipped_existing += 1
             continue
         jobs.append((str(repo), str(dataset), str(output), str(svg_path)))
