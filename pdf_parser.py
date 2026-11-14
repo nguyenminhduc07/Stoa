@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from pathlib import Path
+import hashlib
 import re
+import tempfile
 from typing import Any, Dict, List, Optional
 
 
@@ -208,13 +210,241 @@ def _find_row(tables: List[Dict[str, Any]], target: str, category: str) -> Optio
     return {"table": table, "index": index, "row": row, "title": title}
 
 
-def answer_pdf_question(question: str, document: Dict[str, Any]) -> Dict[str, Any]:
-    """Retrieve a grounded schedule answer from parsed PDF tables.
+def _page_dimensions(pages: List[Dict[str, Any]], page_num: int) -> Optional[List[float]]:
+    for p in pages:
+        if p.get("page") == page_num and p.get("width") and p.get("height"):
+            return [float(p["width"]), float(p["height"])]
+    return None
 
-    This first version answers schedule/text questions. Symbol-count questions
-    on plans are returned as unsupported because PDF text extraction cannot
-    reliably count drawn objects.
-    """
+
+def _attach_pdf_page_sizes(result: Dict[str, Any], pages: List[Dict[str, Any]]) -> Dict[str, Any]:
+    for item in result.get("evidence") or []:
+        if isinstance(item, dict):
+            page_num = int(item.get("page", 1) or 1)
+            dims = _page_dimensions(pages, page_num)
+            if dims and "page_size" not in item:
+                item["page_size"] = dims
+            if "bbox" not in item and item.get("table_bbox"):
+                item["bbox"] = item["table_bbox"]
+            item.setdefault("coordinate_system", "PDF points; origin at top-left")
+    return result
+
+
+def _answer_pdf_text_lookup(question: str, document: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Answer title-block, quoted-label, or printed-dimension questions from PDF words."""
+    from image_parser import _answer_raster_text_question, _fold_text, _ocr_lines, _drawing_metadata, _DIMENSION_PATTERN
+
+    folded = _fold_text(question)
+    aggregate_terms = (
+        "how many", "number of", "count", "quantity of", "combien", "wie viele",
+        "anzahl", "kuinka monta", "montako", "hvor mange", "mitu", "area", "flache",
+        "surface", "superficie", "pinta-ala", "pindala", "volume", "volumen",
+    )
+    if any(term in folded for term in aggregate_terms):
+        return None
+
+    source_path = document.get("source", {}).get("path")
+    for page in document.get("pages", []):
+        raw_words = page.get("words", [])
+        if not raw_words:
+            continue
+        word_boxes = [
+            {
+                "text": str(w.get("text", "")),
+                "confidence": float(w.get("confidence", 1.0)),
+                "bbox": [float(w["x0"]), float(w["top"]), float(w["x1"]), float(w["bottom"])],
+            }
+            for w in raw_words
+            if str(w.get("text", "")).strip() and all(k in w for k in ("x0", "top", "x1", "bottom"))
+        ]
+        if not word_boxes:
+            continue
+        lines = _ocr_lines(word_boxes)
+        measurements = [
+            {"text": m.group(0), "bbox": line["bbox"], "confidence": line["confidence"], "page": page["page"]}
+            for line in lines for m in _DIMENSION_PATTERN.finditer(line["text"])
+        ]
+        synthetic_doc = {
+            "source": {"path": source_path, "format": "PDF"},
+            "lines": lines,
+            "measurements": measurements,
+            "drawing_metadata": _drawing_metadata(lines),
+        }
+        res = _answer_raster_text_question(question, synthetic_doc)
+        if res is not None and res.get("status") == "answered":
+            for ev in res.get("evidence") or []:
+                ev["page"] = page["page"]
+                ev["page_size"] = [float(page["width"]), float(page["height"])]
+                ev["coordinate_system"] = "PDF points; origin at top-left"
+            if res.get("method"):
+                res["method"] = str(res["method"]).replace("raster_ocr_", "pdf_text_")
+            return res
+    return None
+
+
+def _render_pdf_page_document(
+    pdf_path: Path,
+    page_info: Dict[str, Any],
+    document: Dict[str, Any],
+    render_dir: Optional[Path] = None,
+    resolution: int = 150,
+) -> Dict[str, Any]:
+    """Render one PDF page to PNG once and cache its parsed image document."""
+    page_num = int(page_info.get("page", 1))
+    rendered_cache = document.setdefault("rendered_pages", {})
+    if page_num in rendered_cache:
+        return rendered_cache[page_num]
+
+    import pdfplumber
+    from image_parser import parse_image
+
+    target_dir = Path(render_dir) if render_dir else Path(tempfile.gettempdir()) / "stoa-pdf-renders"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    stat = pdf_path.stat()
+    digest = hashlib.sha256(
+        f"{pdf_path.resolve()}\0{stat.st_size}\0{stat.st_mtime_ns}\0p{page_num}\0dpi{resolution}".encode("utf-8")
+    ).hexdigest()[:16]
+    image_path = target_dir / f"{pdf_path.stem}_p{page_num}_{digest}.png"
+    if not image_path.is_file():
+        with pdfplumber.open(pdf_path) as pdf:
+            page = pdf.pages[page_num - 1]
+            rendered = page.to_image(resolution=resolution).original.convert("RGB")
+            rendered.save(image_path, format="PNG")
+
+    image_doc = parse_image(image_path, run_ocr=True)
+    # Classify rendered page with CLIP if available so elevations/schedules are distinguished from floor plans.
+    drawing_type = "uncertain"
+    try:
+        from file_classifier import DocumentRouter
+        router = DocumentRouter(str(pdf_path.parent))
+        predicted = router._classify_image(image_path)
+        drawing_type = predicted or "uncertain"
+    except Exception:
+        drawing_type = "uncertain"
+    image_doc["drawing_type"] = drawing_type
+    image_doc["pdf_page"] = page_num
+    image_doc["pdf_page_size"] = [float(page_info["width"]), float(page_info["height"])]
+    rendered_cache[page_num] = image_doc
+    return image_doc
+
+
+def _answer_pdf_visual_fallback(
+    question: str,
+    document: Dict[str, Any],
+    *,
+    render_dir: Optional[Path] = None,
+    model_path: Optional[str | Path] = None,
+    geometry_model_path: Optional[str | Path] = None,
+    cubicasa_repo_path: Optional[str | Path] = None,
+    cubicasa_weights_path: Optional[str | Path] = None,
+    object_detector_model: Optional[str | Path] = None,
+    query_plan: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Render a PDF drawing page when visual/floor-plan analysis is needed."""
+    q_low = question.casefold()
+    if any(term in q_low for term in ("schedule", "scheduled", "in the model", "im modell", "dans le modele", "dans le modèle")):
+        return None
+    source_str = document.get("source", {}).get("path")
+    if not source_str:
+        return None
+    pdf_path = Path(source_str)
+    if not pdf_path.is_file():
+        return None
+    pages = document.get("pages", [])
+    if not pages:
+        return None
+
+    page_match = re.search(r"\b(?:page|sivu|seite|blad)\s+(\d+)\b", q_low)
+    selected_page: Optional[Dict[str, Any]] = None
+    if page_match:
+        wanted_page = int(page_match.group(1))
+        selected_page = next((p for p in pages if p.get("page") == wanted_page), None)
+        if selected_page is None:
+            return {
+                "status": "not_found",
+                "answer": None,
+                "reason": f"Page {wanted_page} does not exist in this {len(pages)}-page PDF.",
+                "evidence": [],
+            }
+    elif len(pages) == 1:
+        selected_page = pages[0]
+    elif len(pages) <= 5:
+        drawing_pages = [
+            p for p in pages
+            if (p.get("vector_line_count", 0) + p.get("vector_curve_count", 0)) >= 20 or p.get("image_count", 0) >= 1
+        ]
+        if len(drawing_pages) == 1:
+            selected_page = drawing_pages[0]
+        elif len(drawing_pages) > 1:
+            return {
+                "status": "clarification_required",
+                "answer": f"This PDF has {len(pages)} pages; specify the page number (e.g. 'on page 1') for visual analysis.",
+                "reason": "Visual floor-plan analysis requires selecting a specific page on multi-sheet PDFs.",
+                "evidence": [],
+            }
+    if selected_page is None:
+        return None
+
+    image_doc = _render_pdf_page_document(pdf_path, selected_page, document, render_dir=render_dir)
+    from image_parser import answer_image_question
+    visual_res = answer_image_question(
+        question,
+        image_doc,
+        model_path=model_path,
+        geometry_model_path=geometry_model_path,
+        cubicasa_repo_path=cubicasa_repo_path,
+        cubicasa_weights_path=cubicasa_weights_path,
+        object_detector_model=object_detector_model,
+        query_plan=query_plan,
+    )
+    if visual_res.get("status") == "unsupported":
+        return None
+
+    page_num = int(selected_page.get("page", 1))
+    page_w, page_h = float(selected_page["width"]), float(selected_page["height"])
+    img_w = max(1.0, float(image_doc.get("width") or page_w))
+    img_h = max(1.0, float(image_doc.get("height") or page_h))
+    sx, sy = page_w / img_w, page_h / img_h
+
+    mapped_evidence = []
+    for ev in visual_res.get("evidence") or []:
+        ev_copy = dict(ev)
+        ev_copy["source"] = str(pdf_path)
+        ev_copy["page"] = page_num
+        ev_copy["page_size"] = [page_w, page_h]
+        raw_bbox = ev_copy.get("bbox")
+        if isinstance(raw_bbox, list) and len(raw_bbox) == 4:
+            ev_copy["bbox"] = [
+                round(float(raw_bbox[0]) * sx, 2),
+                round(float(raw_bbox[1]) * sy, 2),
+                round(float(raw_bbox[2]) * sx, 2),
+                round(float(raw_bbox[3]) * sy, 2),
+            ]
+        ev_copy["coordinate_system"] = "PDF points; origin at top-left"
+        mapped_evidence.append(ev_copy)
+
+    out = dict(visual_res)
+    out["evidence"] = mapped_evidence
+    if out.get("method"):
+        out["method"] = f"pdf_rendered_visual:{out['method']}"
+    out["review_recommended"] = True
+    return out
+
+
+def answer_pdf_question(
+    question: str,
+    document: Dict[str, Any],
+    *,
+    enable_visual_fallback: bool = False,
+    render_dir: Optional[Path] = None,
+    model_path: Optional[str | Path] = None,
+    geometry_model_path: Optional[str | Path] = None,
+    cubicasa_repo_path: Optional[str | Path] = None,
+    cubicasa_weights_path: Optional[str | Path] = None,
+    object_detector_model: Optional[str | Path] = None,
+    query_plan: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Retrieve a grounded schedule, text, or rendered-visual answer from a PDF."""
     pages = document.get("pages", [])
     all_text = "\n".join(page.get("text", "") for page in pages)
     tables = [table for page in pages for table in page.get("tables", [])]
@@ -248,11 +478,11 @@ def answer_pdf_question(question: str, document: Dict[str, Any]) -> Dict[str, An
                     selected.append(row_index)
             if selected:
                 answer = f"{len(selected)} rooms, {sum(area_values)} SF"
-                return {"status": "answered", "answer": answer, "evidence": [{
+                return _attach_pdf_page_sizes({"status": "answered", "answer": answer, "evidence": [{
                     "page": 1, "table_bbox": data_table.get("bbox"), "rows": selected,
                     "rows_text": [_table_rows(data_table)[i] for i in selected],
                     "source": document.get("source", {}).get("path"),
-                }]}
+                }]}, pages)
 
     if "largest area" in question.casefold():
         data_table = next((t for t in tables if any(len(row) >= 10 and any("SF" in str(c or "") for c in row[:1]) for row in _table_rows(t))), None)
@@ -267,10 +497,10 @@ def answer_pdf_question(question: str, document: Dict[str, Any]) -> Dict[str, An
             if candidates:
                 area, row_index, row = max(candidates)
                 answer = f"Room {row[1]} {row[2]} ({area} SF)"
-                return {"status": "answered", "answer": answer, "evidence": [{
+                return _attach_pdf_page_sizes({"status": "answered", "answer": answer, "evidence": [{
                     "page": 1, "table_bbox": data_table.get("bbox"), "rows": [row_index],
                     "rows_text": [row], "source": document.get("source", {}).get("path"),
-                }]}
+                }]}, pages)
 
     if target:
         found = _find_row(tables, target, category)
@@ -348,7 +578,7 @@ def answer_pdf_question(question: str, document: Dict[str, Any]) -> Dict[str, An
                     "row": found["index"], "row_text": row,
                     "headers": headers, "source": document.get("source", {}).get("path"),
                 })
-                return {"status": "answered", "answer": answer, "evidence": evidence}
+                return _attach_pdf_page_sizes({"status": "answered", "answer": answer, "evidence": evidence}, pages)
 
     # Window schedule dimensions: this schedule is a compact 5-column table.
     if "window schedule" in question.casefold() and "width" in question.casefold() and "height" in question.casefold():
@@ -357,10 +587,29 @@ def answer_pdf_question(question: str, document: Dict[str, Any]) -> Dict[str, An
             table = min(candidates, key=lambda t: len(_table_rows(t)))
             row = _table_rows(table)[0]
             if len(row) >= 5:
-                return {"status": "answered", "answer": f"{row[3]} wide x {row[4]} high", "evidence": [{
+                return _attach_pdf_page_sizes({"status": "answered", "answer": f"{row[3]} wide x {row[4]} high", "evidence": [{
                     "page": 1, "table_bbox": table.get("bbox"), "row": 0,
                     "row_text": row, "source": document.get("source", {}).get("path"),
-                }]}
+                }]}, pages)
+
+    text_lookup = _answer_pdf_text_lookup(question, document)
+    if text_lookup is not None:
+        return text_lookup
+
+    if enable_visual_fallback:
+        visual = _answer_pdf_visual_fallback(
+            question,
+            document,
+            render_dir=render_dir,
+            model_path=model_path,
+            geometry_model_path=geometry_model_path,
+            cubicasa_repo_path=cubicasa_repo_path,
+            cubicasa_weights_path=cubicasa_weights_path,
+            object_detector_model=object_detector_model,
+            query_plan=query_plan,
+        )
+        if visual is not None:
+            return visual
 
     # For table or symbol counts, do not convert page-wide text mentions into
     # a count; the count may belong to a different view or schedule.

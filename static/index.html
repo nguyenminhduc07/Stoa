@@ -44,6 +44,13 @@
     .dot { width: 6px; height: 6px; border-radius: 50%; background: #a4abb3; }
     .dot.parsed { background: #38845f; }
     .dot.error { background: #c45151; }
+    .type-select { margin-top: 7px; width: 100%; padding: 4px 6px; border: 1px solid var(--line); border-radius: 6px; background: #f8f9fa; color: var(--ink); font-size: 11px; }
+    .citation-preview { margin-top: 11px; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; background: #fafbfc; }
+    .citation-preview-bar { display: flex; justify-content: space-between; align-items: center; padding: 6px 10px; border-bottom: 1px solid var(--line); color: var(--muted); font-size: 11px; font-weight: 600; }
+    .citation-stage { position: relative; width: 100%; max-height: 440px; overflow: auto; display: grid; place-items: center; background: #fff; }
+    .citation-canvas { position: relative; display: inline-block; max-width: 100%; line-height: 0; }
+    .citation-canvas img { display: block; max-width: 100%; max-height: 420px; width: auto; height: auto; }
+    .citation-canvas svg { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
     .scope-control { margin-top: auto; padding: 12px; border-radius: 10px; background: #e7e9ec; color: var(--muted); font-size: 12px; line-height: 1.5; }
     main { min-width: 0; display: flex; flex-direction: column; height: 100vh; }
     .topbar { height: 64px; flex: 0 0 64px; display: flex; align-items: center; justify-content: space-between; padding: 0 28px; border-bottom: 1px solid var(--line); background: rgba(255,255,255,.72); }
@@ -216,7 +223,24 @@
             status.append(document.createTextNode(file.parse_status === 'parsed' ? 'Ready' : file.parse_status === 'error' ? 'Parse issue' : 'Uploaded'));
             meta.append(status, make('span', '', `${(file.format || 'file').toUpperCase()} · ${formatBytes(file.size_bytes)}`));
             card.append(meta);
-            if (file.drawing_type) card.append(make('div', 'file-meta', `Image type · ${file.drawing_type.replaceAll('_', ' ')}`));
+            if (file.format === 'image') {
+              const select = make('select', 'type-select');
+              select.setAttribute('aria-label', `Drawing type for ${file.name}`);
+              ['floor_plan', 'elevation', 'section', 'detail', 'site_plan', 'map', 'other', 'uncertain'].forEach(opt => {
+                const option = make('option', '', `Type: ${opt.replaceAll('_', ' ')}`);
+                option.value = opt;
+                if ((file.drawing_type || 'uncertain') === opt) option.selected = true;
+                select.append(option);
+              });
+              select.addEventListener('click', event => event.stopPropagation());
+              select.addEventListener('change', async event => {
+                event.stopPropagation();
+                await updateDrawingType(file.file_id, event.target.value);
+              });
+              card.append(select);
+            } else if (file.drawing_type) {
+              card.append(make('div', 'file-meta', `Image type · ${file.drawing_type.replaceAll('_', ' ')}`));
+            }
             if (file.parse_error) card.title = file.parse_error;
             card.addEventListener('click', () => {
               state.selectedFileId = state.selectedFileId === file.file_id ? null : file.file_id;
@@ -241,6 +265,74 @@
       function displayValue(value) {
         if (value === undefined || value === null || value === '') return null;
         return typeof value === 'object' ? JSON.stringify(value, null, 2) : String(value);
+      }
+      function collectCitationBoxes(evidence) {
+        if (!Array.isArray(evidence)) return [];
+        const boxes = [];
+        const isBox = (b) => Array.isArray(b) && b.length === 4 && b.every(v => Number.isFinite(Number(v)));
+        evidence.forEach(item => {
+          if (!item || typeof item !== 'object') return;
+          const page = Number(item.page || 1);
+          const pageSize = Array.isArray(item.page_size) && item.page_size.length === 2 ? item.page_size.map(Number) : null;
+          const box = isBox(item.bbox) ? item.bbox.map(Number) : (isBox(item.table_bbox) ? item.table_bbox.map(Number) : null);
+          if (box && !(box[0] === 0 && box[1] === 0 && pageSize && box[2] === pageSize[0] && box[3] === pageSize[1])) {
+            boxes.push({ page, bbox: box, pageSize, label: item.class || item.label || item.ocr_text || '' });
+          }
+          if (Array.isArray(item.labels)) {
+            item.labels.forEach(sub => {
+              if (sub && isBox(sub.bbox)) boxes.push({ page, bbox: sub.bbox.map(Number), pageSize, label: sub.label || sub.ocr_text || '' });
+            });
+          }
+        });
+        return boxes;
+      }
+      function renderVisualCitations(parent, result) {
+        if (!state.conversationId || !result.file_id || !['image', 'pdf'].includes(result.format)) return;
+        const boxes = collectCitationBoxes(result.evidence);
+        if (!boxes.length) return;
+        const page = boxes[0].page || 1;
+        const pageBoxes = boxes.filter(b => b.page === page);
+        const wrap = make('div', 'citation-preview');
+        const bar = make('div', 'citation-preview-bar');
+        bar.append(
+          make('span', '', `${result.file}${result.format === 'pdf' ? ` · Page ${page}` : ''}`),
+          make('span', '', `${pageBoxes.length} cited region${pageBoxes.length === 1 ? '' : 's'}`)
+        );
+        const stage = make('div', 'citation-stage');
+        const canvas = make('div', 'citation-canvas');
+        const img = document.createElement('img');
+        img.alt = `Preview of ${result.file}`;
+        img.loading = 'lazy';
+        img.src = `/conversations/${encodeURIComponent(state.conversationId)}/files/${encodeURIComponent(result.file_id)}/preview?page=${encodeURIComponent(page)}`;
+        const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+        img.addEventListener('load', () => {
+          const refSize = pageBoxes.find(b => b.pageSize)?.pageSize;
+          const vw = refSize ? refSize[0] : img.naturalWidth;
+          const vh = refSize ? refSize[1] : img.naturalHeight;
+          if (!vw || !vh) return;
+          // Ignore full-image fallback bounds [0, 0, vw, vh] so we only highlight localized regions.
+          const localized = pageBoxes.filter(b => !(b.bbox[0] <= 0 && b.bbox[1] <= 0 && Math.abs(b.bbox[2] - vw) < 1 && Math.abs(b.bbox[3] - vh) < 1));
+          if (!localized.length) { wrap.remove(); return; }
+          bar.lastChild.textContent = `${localized.length} cited region${localized.length === 1 ? '' : 's'}`;
+          svg.setAttribute('viewBox', `0 0 ${vw} ${vh}`);
+          const strokeWidth = Math.max(1.5, Math.min(vw, vh) * 0.0035);
+          localized.forEach(entry => {
+            const [x0, y0, x1, y1] = entry.bbox;
+            const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+            rect.setAttribute('x', String(Math.min(x0, x1)));
+            rect.setAttribute('y', String(Math.min(y0, y1)));
+            rect.setAttribute('width', String(Math.max(2, Math.abs(x1 - x0))));
+            rect.setAttribute('height', String(Math.max(2, Math.abs(y1 - y0))));
+            rect.setAttribute('fill', 'rgba(36, 92, 75, 0.18)');
+            rect.setAttribute('stroke', '#1c7c54');
+            rect.setAttribute('stroke-width', String(strokeWidth));
+            rect.setAttribute('rx', String(strokeWidth));
+            svg.appendChild(rect);
+          });
+          scrollBottom();
+        });
+        img.addEventListener('error', () => wrap.remove());
+        canvas.append(img, svg); stage.append(canvas); wrap.append(bar, stage); parent.append(wrap);
       }
       function renderEvidence(parent, evidence) {
         if (!Array.isArray(evidence) || !evidence.length) return;
@@ -295,6 +387,7 @@
           });
           card.append(options);
         }
+        renderVisualCitations(card, result);
         renderEvidence(card, result.evidence); container.append(card); scrollBottom();
       }
       async function createConversation(closePrevious = false) {
@@ -308,6 +401,20 @@
           state.conversationId = data.conversation_id;
           $('chat-label').textContent = `Chat · ${state.conversationId.slice(0, 8)}`;
         } catch (error) { toast(`Could not start a conversation: ${error.message}`); }
+      }
+      async function updateDrawingType(fileId, drawingType) {
+        if (!state.conversationId) return;
+        try {
+          const updated = await request(`/conversations/${encodeURIComponent(state.conversationId)}/files/${encodeURIComponent(fileId)}`, {
+            method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ drawing_type: drawingType }),
+          });
+          state.files = state.files.map(f => f.file_id === fileId ? updated : f);
+          renderFiles();
+        } catch (error) {
+          toast(`Could not update drawing type: ${error.message}`);
+          await refreshFiles();
+        }
       }
       async function refreshFiles() {
         if (!state.conversationId) return;

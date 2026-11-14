@@ -168,13 +168,15 @@ class Router:
                     result = answer_ifc_question(question, index)
                 return "ifc", result
             result = answer_ifc_question(question, index)
-            if result.get("status") == "unsupported":
-                result = answer_ifc_text_question(question, index)
-            if result.get("status") != "unsupported" or kind != "area":
-                return "ifc", result
-            from bim_parser import parse_ifc
-            from bim_qa import answer_area_question
-            return "ifc", answer_area_question(question, self._cached("ifc", model, parse_ifc))
+            if result.get("status") == "unsupported" and kind == "area":
+                from bim_parser import parse_ifc
+                from bim_qa import answer_area_question
+                result = answer_area_question(question, self._cached("ifc", model, parse_ifc))
+            if result.get("status") in {"unsupported", "not_found"}:
+                text_result = answer_ifc_text_question(question, index)
+                if text_result.get("status") == "answered":
+                    result = text_result
+            return "ifc", result
 
         dxf = path.with_suffix(".dxf")
         if dxf.exists():

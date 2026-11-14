@@ -116,7 +116,7 @@ def _extract_room_reference(question: str) -> Optional[str]:
         # "all rooms (spaces)".
         if _normalise(inside) in {"room", "rooms", "space", "spaces", "m2", "m3"}:
             continue
-        number = re.search(r"(?:rum\s*(?:nr\.?\s*)?|room\s*(?:no\.?\s*)?)([a-z0-9.-]+)", inside, re.I)
+        number = re.search(r"(?:rum\s*(?:nr\.?\s*)?|room\s*(?:no\.?\s*)?)#?\s*([a-z0-9.-]+)", inside, re.I)
         return number.group(1) if number else inside
     return None
 

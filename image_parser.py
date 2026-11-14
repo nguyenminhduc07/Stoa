@@ -22,6 +22,7 @@ from floorplan_geometry_model import (
 
 
 SUPPORTED_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
+_NON_FLOORPLAN_TYPES = {"elevation", "section", "detail", "site_plan", "map", "other"}
 _COUNT_MODEL_CACHE: Dict[str, Tuple[Any, Any, int]] = {}
 _GEOMETRY_MODEL_CACHE: Dict[str, Tuple[Any, Any, Any]] = {}
 _CUBICASA_MODEL_CACHE: Dict[Tuple[str, str], Tuple[Any, Any, Any]] = {}
@@ -32,6 +33,16 @@ _DIMENSION_PATTERN = re.compile(
     r"(?<![A-Za-z0-9])(?:\d{1,3}(?:[ ,]\d{3})+|\d+)(?:[.,]\d+)?\s*(?:mm|cm|ft|feet|inches|inch|in|m)(?![A-Za-z])",
     re.IGNORECASE,
 )
+
+
+def default_cubicasa_paths() -> Tuple[Optional[Path], Optional[Path]]:
+    """Return local CubiCasa5K repo and weights paths when present in data/."""
+    root = Path(__file__).resolve().parent / "data"
+    repo = root / "CubiCasa5k"
+    weights = root / "model_best_val_loss_var.pkl"
+    if (repo / "floortrans" / "models" / "hg_furukawa_original.py").is_file() and weights.is_file():
+        return repo, weights
+    return None, None
 
 
 def ocr_image_array(image: Any) -> Tuple[str, List[Dict[str, Any]]]:
@@ -759,29 +770,44 @@ def answer_image_question(
         return text_answer
 
     drawing_type = document.get("drawing_type")
-    if object_detector_model and drawing_type not in {"floor_plan", "uncertain", None}:
+    if object_detector_model and drawing_type in _NON_FLOORPLAN_TYPES:
         detected = _answer_raster_object_count(question, document, object_detector_model)
         if detected is not None:
             return detected
 
-    if drawing_type not in {"floor_plan", "uncertain", None}:
+    if drawing_type in _NON_FLOORPLAN_TYPES:
         return {"status": "unsupported", "answer": None,
                 "reason": "This drawing type has OCR support, but no configured detector supports this question.",
                 "evidence": []}
 
-    if query_plan and query_plan.get("intent") == "count" and query_plan.get("target") in {"rooms", "spaces"}:
-        if drawing_type != "floor_plan":
-            return {
-                "status": "unsupported", "answer": None,
-                "reason": "A total room count needs this image to be identified as a floor plan.",
-                "evidence": [evidence],
-            }
-        scope = str(query_plan.get("scope") or "").casefold()
+    from train_floorplan_model import question_category
+
+    category = question_category(question)
+    folded_q = _fold_text(question)
+    asks_count = any(term in folded_q for term in (
+        "how many", "number of", "count", "quantity of", "combien", "wie viele",
+        "anzahl", "kuinka monta", "montako", "hvor mange", "mitu",
+    ))
+    asks_general_rooms = (
+        (query_plan is not None and query_plan.get("intent") == "count" and query_plan.get("target") in {"rooms", "spaces"})
+        or (
+            query_plan is None
+            and category is None
+            and asks_count
+            and re.search(r"\b(?:rooms?|spaces?|huonetta|huoneita|raume|pieces|locali)\b", folded_q) is not None
+        )
+    )
+
+    if asks_general_rooms:
+        scope = str((query_plan or {}).get("scope") or "").casefold()
         whole_drawing_scopes = (
             "this floor plan", "current floor plan", "this plan", "whole plan", "entire plan",
             "this drawing", "whole drawing", "entire drawing", "current drawing", "this floor",
         )
-        if scope and not any(term in scope for term in whole_drawing_scopes):
+        sub_area_cues = ("apartment ", "wohnung ", "appartement ", "unit ", "level ", "storey ", "floor 1", "floor 2")
+        if (scope and not any(term in scope for term in whole_drawing_scopes)) or (
+            not scope and any(cue in folded_q for cue in sub_area_cues)
+        ):
             return {
                 "status": "unsupported", "answer": None,
                 "reason": "The image parser cannot isolate a room count to the requested sub-area or level yet.",
@@ -789,11 +815,13 @@ def answer_image_question(
             }
         if cubicasa_repo_path is not None and cubicasa_weights_path is not None:
             geometry = _cubicasa_prediction(source, cubicasa_repo_path, cubicasa_weights_path)
+            document["floorplan_specialist"] = geometry
             regions = geometry["rooms"]
             model_name = geometry["model"]
             method = "cubicasa5k_indoor_room_segmentation_components"
         elif geometry_model_path is not None:
             geometry = _geometry_prediction(source, geometry_model_path)
+            document["floorplan_specialist"] = geometry
             excluded = {"background", "outdoor", "wall", "railing"}
             regions = [item for item in geometry["rooms"]
                        if str(item.get("class", "")).casefold() not in excluded]
@@ -823,134 +851,173 @@ def answer_image_question(
             for item in regions
         ]
         return {
-            "status": "answered", "answer": len(regions), "unit": "count",
+            "status": "answered", "value": len(regions), "answer": len(regions), "unit": "count",
             "answer_text": f"{len(regions)} indoor room regions",
             "method": method, "model": model_name, "review_recommended": True,
             "evidence": region_evidence,
         }
 
-    if (cubicasa_repo_path is not None and cubicasa_weights_path is not None
-            and document.get("drawing_type") == "floor_plan"):
-        from train_floorplan_model import question_category
-
-        category = question_category(question)
-        if category:
-            if category == "showers_bathtubs" and any(
-                    term in question.casefold() for term in ("shower", "suihku")):
-                return {"status": "not_found", "answer": None,
-                        "reason": "CubiCasa5K has a bathtub class but no shower class, so this question cannot be answered reliably.",
-                        "evidence": [evidence]}
-            geometry = _cubicasa_prediction(source, cubicasa_repo_path, cubicasa_weights_path)
-            class_for_category = {
-                "windows": ("icons", "Window"), "doors": ("icons", "Door"),
-                "toilet_bowls": ("icons", "Toilet"), "sinks": ("icons", "Sink"),
-                "showers_bathtubs": ("icons", "Bathtub"),
-                "bedrooms": ("rooms", "Bedroom"), "kitchens": ("rooms", "Kitchen"),
-                "bathrooms": ("rooms", "Bath"),
+    def _room_label_fallback(target_category: Optional[str]) -> Optional[Dict[str, Any]]:
+        if not target_category or not source:
+            return None
+        from room_label_qa import SUPPORTED as ROOM_OCR_SUPPORTED, answer_room_question
+        if target_category not in ROOM_OCR_SUPPORTED:
+            return None
+        room_res = answer_room_question(question, source, target_category)
+        if room_res.get("status") != "answered":
+            return None
+        raw_ev = room_res.get("evidence") or []
+        label_items = raw_ev[0].get("labels", []) if raw_ev and isinstance(raw_ev[0], dict) else []
+        formatted_ev = [
+            {
+                "source": source,
+                "page": 1,
+                "bbox": item["bbox"],
+                "coordinate_system": "image pixels; origin at top-left",
+                "label": item.get("label"),
+                "ocr_text": item.get("ocr_text"),
+                "confidence": item.get("conf"),
             }
-            target = class_for_category.get(category)
-            if target is None:
-                return {"status": "not_found", "answer": None,
-                        "reason": f"CubiCasa5K has no direct segmentation class for {category}.",
-                        "evidence": [evidence]}
-            regions = [item for item in geometry[target[0]] if item["class"] == target[1]]
+            for item in label_items
+            if item.get("bbox")
+        ] or [evidence]
+        count_val = int(room_res["value"])
+        return {
+            "status": "answered",
+            "value": count_val,
+            "answer": count_val,
+            "unit": "count",
+            "answer_text": f"{count_val} {target_category.replace('_', ' ')}",
+            "method": room_res.get("method", "room_label_ocr"),
+            "review_recommended": bool(room_res.get("review_recommended")) or drawing_type != "floor_plan",
+            "evidence": formatted_ev,
+        }
+
+    if cubicasa_repo_path is not None and cubicasa_weights_path is not None and category:
+        if category == "showers_bathtubs" and any(
+                term in question.casefold() for term in ("shower", "suihku")):
+            return {"status": "not_found", "answer": None,
+                    "reason": "CubiCasa5K has a bathtub class but no shower class, so this question cannot be answered reliably.",
+                    "evidence": [evidence]}
+        class_for_category = {
+            "windows": ("icons", "Window"), "doors": ("icons", "Door"),
+            "toilet_bowls": ("icons", "Toilet"), "sinks": ("icons", "Sink"),
+            "showers_bathtubs": ("icons", "Bathtub"),
+            "bedrooms": ("rooms", "Bedroom"), "kitchens": ("rooms", "Kitchen"),
+            "bathrooms": ("rooms", "Bath"),
+        }
+        target = class_for_category.get(category)
+        if target is None:
+            ocr_room_result = _room_label_fallback(category)
+            if ocr_room_result is not None:
+                return ocr_room_result
+            return {"status": "not_found", "answer": None,
+                    "reason": f"CubiCasa5K has no direct segmentation class for {category}.",
+                    "evidence": [evidence]}
+        geometry = _cubicasa_prediction(source, cubicasa_repo_path, cubicasa_weights_path)
+        document["floorplan_specialist"] = geometry
+        regions = [item for item in geometry[target[0]] if item["class"] == target[1]]
+        region_evidence = [
+            {"source": source, "page": 1, "bbox": item["bbox"],
+             "coordinate_system": "image pixels; origin at top-left",
+             "class": item["class"], "confidence": item["confidence"]}
+            for item in regions
+        ] or [evidence]
+        answer_label = "bathtubs" if category == "showers_bathtubs" else category.replace("_", " ")
+        return {
+            "status": "answered", "value": len(regions), "answer": len(regions), "unit": "count",
+            "answer_text": f"{len(regions)} {answer_label}",
+            "method": "cubicasa5k_pretrained_segmentation_components",
+            "model": geometry["model"], "review_recommended": True,
+            "evidence": region_evidence,
+        }
+
+    if geometry_model_path is not None and category:
+        path = source
+        if not path:
+            raise ValueError("Parsed image is missing its source path")
+        geometry = _geometry_prediction(path, geometry_model_path)
+        document["floorplan_specialist"] = geometry
+        icon_class = ICON_COUNT_CLASS.get(category)
+        room_class = ROOM_COUNT_CLASS.get(category)
+        if icon_class:
+            regions = [region for region in geometry["icons"] if region["class"] == icon_class]
+            method = "geometry_icon_mask_components"
+        elif room_class:
+            regions = [region for region in geometry["rooms"] if region["class"] == room_class]
+            method = "geometry_room_mask_components"
+        else:
+            regions = None
+
+        if regions is not None:
+            count = len(regions)
             region_evidence = [
-                {"source": source, "page": 1, "bbox": item["bbox"],
+                {"source": path, "page": 1, "bbox": region["bbox"],
                  "coordinate_system": "image pixels; origin at top-left",
-                 "class": item["class"], "confidence": item["confidence"]}
-                for item in regions
+                 "class": region["class"], "confidence": region["confidence"]}
+                for region in regions
             ] or [evidence]
-            answer_label = "bathtubs" if category == "showers_bathtubs" else category.replace("_", " ")
+            auxiliary = geometry["auxiliary_counts"].get(category)
             return {
-                "status": "answered", "answer": len(regions),
-                "answer_text": f"{len(regions)} {answer_label}",
-                "method": "cubicasa5k_pretrained_segmentation_components",
-                "model": geometry["model"], "review_recommended": True,
+                "status": "answered",
+                "value": count,
+                "answer": count,
+                "unit": "count",
+                "answer_text": f"{count} {category.replace('_', ' ')}",
+                "method": method,
+                "auxiliary_count_estimate": auxiliary,
+                "review_recommended": (auxiliary is not None and auxiliary != count) or drawing_type != "floor_plan",
                 "evidence": region_evidence,
             }
 
-    if geometry_model_path is not None and document.get("drawing_type") == "floor_plan":
-        from train_floorplan_model import question_category
+        ocr_room_result = _room_label_fallback(category)
+        if ocr_room_result is not None:
+            return ocr_room_result
 
-        category = question_category(question)
-        if category:
-            path = source
-            if not path:
-                raise ValueError("Parsed image is missing its source path")
-            geometry = _geometry_prediction(path, geometry_model_path)
-            icon_class = ICON_COUNT_CLASS.get(category)
-            room_class = ROOM_COUNT_CLASS.get(category)
-            if icon_class:
-                regions = [region for region in geometry["icons"] if region["class"] == icon_class]
-                method = "geometry_icon_mask_components"
-            elif room_class:
-                regions = [region for region in geometry["rooms"] if region["class"] == room_class]
-                method = "geometry_room_mask_components"
-            else:
-                regions = None
-
-            if regions is not None:
-                count = len(regions)
-                region_evidence = [
-                    {"source": path, "page": 1, "bbox": region["bbox"],
-                     "coordinate_system": "image pixels; origin at top-left",
-                     "class": region["class"], "confidence": region["confidence"]}
-                    for region in regions
-                ]
-                if not region_evidence:
-                    region_evidence = [evidence]
-                auxiliary = geometry["auxiliary_counts"].get(category)
-                return {
-                    "status": "answered",
-                    "answer": count,
-                    "answer_text": f"{count} {category.replace('_', ' ')}",
-                    "method": method,
-                    "auxiliary_count_estimate": auxiliary,
-                    "review_recommended": auxiliary is not None and auxiliary != count,
-                    "evidence": region_evidence,
-                }
-
-            # Some QA categories (for example storeys and shower fixtures) do
-            # not have matching classes in the CubiCasa masks. Keep their
-            # learned image-level estimate separate from geometric detections.
-            if geometry["count_mae"].get(category) is None:
-                return {
-                    "status": "not_found",
-                    "answer": None,
-                    "reason": (
-                        f"The geometry taxonomy has no direct class for {category}, "
-                        "and this checkpoint has no QA supervision for its auxiliary count head."
-                    ),
-                    "evidence": [evidence],
-                }
+        if geometry["count_mae"].get(category) is None:
             return {
-                "status": "answered",
-                "answer": geometry["auxiliary_counts"][category],
-                "answer_text": f"{geometry['auxiliary_counts'][category]} {category.replace('_', ' ')}",
-                "method": "weakly_supervised_count_head",
-                "review_recommended": True,
+                "status": "not_found",
+                "answer": None,
+                "reason": (
+                    f"The geometry taxonomy has no direct class for {category}, "
+                    "and this checkpoint has no QA supervision for its auxiliary count head."
+                ),
                 "evidence": [evidence],
             }
+        est_count = geometry["auxiliary_counts"][category]
+        return {
+            "status": "answered",
+            "value": est_count,
+            "answer": est_count,
+            "unit": "count",
+            "answer_text": f"{est_count} {category.replace('_', ' ')}",
+            "method": "weakly_supervised_count_head",
+            "review_recommended": True,
+            "evidence": [evidence],
+        }
 
-    if model_path is not None and document.get("drawing_type") == "floor_plan":
-        from train_floorplan_model import question_category
+    if model_path is not None and category:
+        image_path = source
+        if not image_path:
+            raise ValueError("Parsed image is missing its source path")
+        count, model_info = _count_prediction(image_path, model_path, category)
+        label = category.replace("_", " ")
+        return {
+            "status": "answered",
+            "value": count,
+            "answer": count,
+            "unit": "count",
+            "answer_text": f"{count} {label}",
+            "method": "shared_cnn_count_head",
+            "model": model_info,
+            "review_recommended": True,
+            "evidence": [evidence],
+        }
 
-        category = question_category(question)
-        if category:
-            image_path = source
-            if not image_path:
-                raise ValueError("Parsed image is missing its source path")
-            count, model_info = _count_prediction(image_path, model_path, category)
-            label = category.replace("_", " ")
-            return {
-                "status": "answered",
-                "answer": count,
-                "answer_text": f"{count} {label}",
-                "method": "shared_cnn_count_head",
-                "model": model_info,
-                "review_recommended": True,
-                "evidence": [evidence],
-            }
+    if category:
+        ocr_room_result = _room_label_fallback(category)
+        if ocr_room_result is not None:
+            return ocr_room_result
 
     return {
         "status": "unsupported",

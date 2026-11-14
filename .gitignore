@@ -13,3 +13,5 @@ __pycache__/
 # Local tools and machine-specific settings
 /oda_tmp/
 ezdxf.ini
+.env
+.env.*

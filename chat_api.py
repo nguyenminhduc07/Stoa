@@ -107,6 +107,7 @@ def create_conversation():
         cubicasa_repo=os.environ.get("STOA_CUBICASA_REPO"),
         cubicasa_weights=os.environ.get("STOA_CUBICASA_WEIGHTS"),
         object_detector_model=os.environ.get("STOA_OBJECT_DETECTOR_MODEL"),
+        render_dir=directory / "_renders",
     )
     with _sessions_lock:
         _sessions[conversation_id] = SessionRecord(pipeline=pipeline, directory=directory)
@@ -162,6 +163,36 @@ def upload_files(conversation_id: str, files: List[UploadFile] = File(...)):
 @app.get("/conversations/{conversation_id}/files")
 def list_files(conversation_id: str):
     return {"files": _public_manifest(_session(conversation_id))}
+
+
+@app.get("/conversations/{conversation_id}/files/{file_id}/preview")
+def preview_file(conversation_id: str, file_id: str, page: int = 1):
+    record = _session(conversation_id)
+    entry = record.pipeline.files.get(file_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"Unknown file_id: {file_id}")
+    if entry.format == "image":
+        return FileResponse(entry.path)
+    if entry.format == "pdf":
+        if page < 1:
+            raise HTTPException(status_code=400, detail="Page number must be >= 1.")
+        renders = record.directory / "_renders"
+        renders.mkdir(parents=True, exist_ok=True)
+        preview_path = renders / f"preview_{file_id}_p{page}.png"
+        if not preview_path.is_file():
+            try:
+                import pdfplumber
+                with pdfplumber.open(entry.path) as pdf:
+                    if page > len(pdf.pages):
+                        raise HTTPException(status_code=404, detail=f"PDF has only {len(pdf.pages)} page(s).")
+                    rendered = pdf.pages[page - 1].to_image(resolution=150).original.convert("RGB")
+                    rendered.save(preview_path, format="PNG")
+            except HTTPException:
+                raise
+            except Exception as exc:
+                raise HTTPException(status_code=500, detail=f"Could not render PDF preview: {exc}") from exc
+        return FileResponse(preview_path, media_type="image/png")
+    raise HTTPException(status_code=400, detail=f"Visual preview is not available for {entry.format} files.")
 
 
 @app.patch("/conversations/{conversation_id}/files/{file_id}")
