@@ -26,6 +26,9 @@ format: IFC > DXF > vector PDF > raster image.
 | `cad_parser.py` | DXF/DWG parsing (Swiss dwellings) | Duc |
 | `pdf_parser.py` / `evaluate_pdf_text.py` | PDF schedules + eval | Duc |
 | `image_parser.py`, `floorplan_model.py`, `floorplan_geometry_model.py`, `train_floorplan*.py`, `prepare_cubicasa_masks.py` | raster evidence and floor-plan CNNs | Codex |
+| `cad_qa.py` / `evaluate_cad.py` | DXF floor-plan answers (Swiss dwellings) + eval | Minh |
+| `evaluate_all.py` | routes every question to its answerer, one overall score | Minh |
+| _(add yours here)_ | | |
 
 Only edit files you own. If you must change someone else's file, keep the diff minimal and
 say so in the PR description.
@@ -40,7 +43,7 @@ say so in the PR description.
 ## Rules
 1. **No overfitting to preview files.** No hard-coded sheet names, project names, file names or
    answers. The final test set is different data. Generic rules only.
-2. **Measure every change.** Run the relevant `evaluate_*.py` before and after; put both numbers
+2. **Measure every change.** Run `evaluate_all.py` (and the relevant `evaluate_*.py`) before and after; put both numbers
    in the commit message or PR, e.g. `IFC area: 550/580 -> 580/580`.
 3. **Small branches, merge often.** Branch per task (`feat/...`, `fix/...`), PR into `master`,
    merge every 2–3 hours. `master` must always run.
@@ -51,6 +54,8 @@ say so in the PR description.
 ## Run
 ```
 pip install -r requirements.txt
+python evaluate_all.py --questions junction-dataset-preview/questions.jsonl --data junction-dataset-preview/data --failures-out failures.jsonl
 python evaluate_bim_area.py --questions junction-dataset-preview/questions.jsonl --data junction-dataset-preview/data
 python evaluate_pdf_text.py --questions junction-dataset-preview/questions.jsonl --data junction-dataset-preview/data
+python evaluate_cad.py --questions junction-dataset-preview/questions.jsonl --data junction-dataset-preview/data
 ```
