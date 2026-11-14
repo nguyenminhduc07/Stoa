@@ -6,6 +6,7 @@ from pathlib import Path
 import math
 import re
 import struct
+import sys
 from typing import Any, Dict, List, Optional, Tuple
 
 from floorplan_model import CATEGORY_NAMES, MODEL_VERSION, SharedFloorplanCounter, require_torch
@@ -22,6 +23,7 @@ from floorplan_geometry_model import (
 SUPPORTED_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 _COUNT_MODEL_CACHE: Dict[str, Tuple[Any, Any, int]] = {}
 _GEOMETRY_MODEL_CACHE: Dict[str, Tuple[Any, Any, Any]] = {}
+_CUBICASA_MODEL_CACHE: Dict[Tuple[str, str], Tuple[Any, Any, Any]] = {}
 
 
 def _png_dimensions(data: bytes) -> Optional[Tuple[int, int]]:
@@ -350,12 +352,117 @@ def _geometry_prediction(
     }
 
 
+
+def _load_cubicasa_model(repo_path: str | Path, weights_path: str | Path):
+    """Load the official CubiCasa5K model and its published checkpoint."""
+    torch = require_torch()
+    repo = Path(repo_path).expanduser().resolve()
+    weights = Path(weights_path).expanduser().resolve()
+    key = (str(repo), str(weights))
+    if key in _CUBICASA_MODEL_CACHE:
+        return _CUBICASA_MODEL_CACHE[key]
+    if not (repo / "floortrans" / "models" / "hg_furukawa_original.py").is_file():
+        raise FileNotFoundError(f"CubiCasa5K checkout is missing floortrans/models: {repo}")
+    if not weights.is_file():
+        raise FileNotFoundError(f"CubiCasa5K pretrained checkpoint not found: {weights}")
+    repo_text = str(repo)
+    if repo_text not in sys.path:
+        sys.path.insert(0, repo_text)
+    # Instantiate the official architecture directly. The released CubiCasa
+    # checkpoint contains every parameter, so inference does not need to load
+    # the separate ImageNet/pose initialization weights used before training.
+    from floortrans.models.hg_furukawa_original import hg_furukawa_original
+    model = hg_furukawa_original(44)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    try:
+        checkpoint = torch.load(weights, map_location=device, weights_only=True)
+    except TypeError:
+        checkpoint = torch.load(weights, map_location=device)
+    if not isinstance(checkpoint, dict) or "model_state" not in checkpoint:
+        raise ValueError("Expected the official CubiCasa checkpoint with a 'model_state' entry")
+    model.load_state_dict(checkpoint["model_state"])
+    model.to(device).eval()
+    loaded = (model, device, checkpoint)
+    _CUBICASA_MODEL_CACHE[key] = loaded
+    return loaded
+
+
+def _cubicasa_prediction(image_path: str | Path, repo_path: str | Path, weights_path: str | Path):
+    """Run official 44-channel CubiCasa inference and return localized classes."""
+    torch = require_torch()
+    import numpy as np
+    try:
+        from PIL import Image, ImageOps
+    except ImportError as exc:
+        raise RuntimeError("CubiCasa inference requires Pillow: pip install pillow") from exc
+
+    model, device, _checkpoint = _load_cubicasa_model(repo_path, weights_path)
+    with Image.open(image_path) as source_image:
+        image = ImageOps.exif_transpose(source_image).convert("RGB")
+        original_width, original_height = image.size
+        # Match the upstream F1_scaled model input scale and pad to the network's
+        # 64-pixel stride so the decoder output aligns with the input.
+        scale = min(1.0, 512.0 / max(original_width, original_height))
+        resized_size = (max(1, round(original_width * scale)), max(1, round(original_height * scale)))
+        image = image.resize(resized_size, Image.Resampling.LANCZOS) if resized_size != image.size else image
+        input_width = ((resized_size[0] + 63) // 64) * 64
+        input_height = ((resized_size[1] + 63) // 64) * 64
+        canvas = Image.new("RGB", (input_width, input_height), "white")
+        canvas.paste(image, (0, 0))
+        tensor = torch.frombuffer(bytearray(canvas.tobytes()), dtype=torch.uint8)
+        tensor = tensor.reshape(input_height, input_width, 3).permute(2, 0, 1).float().div(127.5).sub(1.0)
+
+    with torch.no_grad():
+        outputs = model(tensor.unsqueeze(0).to(device))[0]
+        room_prob = torch.softmax(outputs[21:33], dim=0).cpu().numpy()
+        icon_prob = torch.softmax(outputs[33:44], dim=0).cpu().numpy()
+
+    room_classes = ("Background", "Outdoor", "Wall", "Kitchen", "Living Room", "Bedroom",
+                    "Bath", "Hallway", "Railing", "Storage", "Garage", "Other rooms")
+    icon_classes = ("Empty", "Window", "Door", "Closet", "Electrical Appliance", "Toilet",
+                    "Sink", "Sauna bench", "Fireplace", "Bathtub", "Chimney")
+    scale_x, scale_y = original_width / resized_size[0], original_height / resized_size[1]
+
+    def regions(probabilities, names, min_area, room=False):
+        labels = probabilities.argmax(axis=0)
+        result = []
+        for class_id, name in enumerate(names):
+            if class_id == 0:
+                continue
+            mask = labels == class_id
+            if room:
+                # The upstream room labels include the whole wall/room polygon;
+                # exclude the common structural classes from room-object results.
+                if name in {"Outdoor", "Wall", "Railing"}:
+                    continue
+            for component in _connected_components(mask, min_area):
+                x0, y0, x1, y1 = (component[k] for k in ("x0", "y0", "x1", "y1"))
+                confidence = float(probabilities[class_id, y0:y1, x0:x1].mean())
+                result.append({
+                    "class": name,
+                    "bbox": [max(0, int(x0 * scale_x)), max(0, int(y0 * scale_y)),
+                             min(original_width, int(math.ceil(x1 * scale_x))),
+                             min(original_height, int(math.ceil(y1 * scale_y)))],
+                    "confidence": round(confidence, 4),
+                    "area_px": int(round(component["area"] * scale_x * scale_y)),
+                })
+        return result
+
+    return {
+        "rooms": regions(room_prob, room_classes, 12, room=True),
+        "icons": regions(icon_prob, icon_classes, 3),
+        "model": "CubiCasa5K model_best_val_loss_var",
+    }
+
 def answer_image_question(
     question: str,
     document: Dict[str, Any],
     *,
     model_path: str | Path | None = None,
     geometry_model_path: str | Path | None = None,
+    cubicasa_repo_path: str | Path | None = None,
+    cubicasa_weights_path: str | Path | None = None,
 ) -> Dict[str, Any]:
     """Answer OCR lookups or learned image-level count questions.
 
@@ -384,6 +491,40 @@ def answer_image_question(
                     "answer": " ".join(word["text"] for word in found),
                     "evidence": [{**evidence, "bbox": found[0].get("bbox"), "ocr_words": found}],
                 }
+
+    if (cubicasa_repo_path is not None and cubicasa_weights_path is not None
+            and document.get("drawing_type") == "floor_plan"):
+        from train_floorplan_model import question_category
+
+        category = question_category(question)
+        if category:
+            geometry = _cubicasa_prediction(source, cubicasa_repo_path, cubicasa_weights_path)
+            class_for_category = {
+                "windows": ("icons", "Window"), "doors": ("icons", "Door"),
+                "toilet_bowls": ("icons", "Toilet"), "sinks": ("icons", "Sink"),
+                "showers_bathtubs": ("icons", "Bathtub"),
+                "bedrooms": ("rooms", "Bedroom"), "kitchens": ("rooms", "Kitchen"),
+                "bathrooms": ("rooms", "Bath"),
+            }
+            target = class_for_category.get(category)
+            if target is None:
+                return {"status": "not_found", "answer": None,
+                        "reason": f"CubiCasa5K has no direct segmentation class for {category}.",
+                        "evidence": [evidence]}
+            regions = [item for item in geometry[target[0]] if item["class"] == target[1]]
+            region_evidence = [
+                {"source": source, "page": 1, "bbox": item["bbox"],
+                 "coordinate_system": "image pixels; origin at top-left",
+                 "class": item["class"], "confidence": item["confidence"]}
+                for item in regions
+            ] or [evidence]
+            return {
+                "status": "answered", "answer": len(regions),
+                "answer_text": f"{len(regions)} {category.replace('_', ' ')}",
+                "method": "cubicasa5k_pretrained_segmentation_components",
+                "model": geometry["model"], "review_recommended": True,
+                "evidence": region_evidence,
+            }
 
     if geometry_model_path is not None and document.get("drawing_type") == "floor_plan":
         from train_floorplan_model import question_category
@@ -472,9 +613,9 @@ def answer_image_question(
         "status": "unsupported",
         "answer": None,
         "reason": (
-            "This image question needs visual reasoning. Supply a trained floor-plan "
-            "count-model checkpoint for supported count questions; the current QA-trained "
-            "model estimates image-level totals and does not localize individual objects."
+            "This image question needs visual reasoning. Configure the CubiCasa5K "
+            "checkout and pretrained weights (STOA_CUBICASA_REPO and "
+            "STOA_CUBICASA_WEIGHTS) to answer supported floor-plan counts."
         ),
         "evidence": [evidence],
     }

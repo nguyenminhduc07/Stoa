@@ -92,6 +92,8 @@ def create_conversation():
     pipeline = ConversationPipeline(
         count_model=os.environ.get("STOA_COUNT_MODEL"),
         geometry_model=os.environ.get("STOA_GEOMETRY_MODEL"),
+        cubicasa_repo=os.environ.get("STOA_CUBICASA_REPO"),
+        cubicasa_weights=os.environ.get("STOA_CUBICASA_WEIGHTS"),
     )
     with _sessions_lock:
         _sessions[conversation_id] = SessionRecord(pipeline=pipeline, directory=directory)

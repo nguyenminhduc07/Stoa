@@ -66,9 +66,13 @@ class ConversationPipeline:
         *,
         count_model: Optional[str | Path] = None,
         geometry_model: Optional[str | Path] = None,
+        cubicasa_repo: Optional[str | Path] = None,
+        cubicasa_weights: Optional[str | Path] = None,
     ) -> None:
         self.count_model = Path(count_model) if count_model else None
         self.geometry_model = Path(geometry_model) if geometry_model else None
+        self.cubicasa_repo = Path(cubicasa_repo) if cubicasa_repo else None
+        self.cubicasa_weights = Path(cubicasa_weights) if cubicasa_weights else None
         self.files: Dict[str, FileEntry] = {}
         self._groups: Dict[str, List[str]] = {}
         self._active_group: Optional[str] = None
@@ -332,7 +336,9 @@ class ConversationPipeline:
         elif entry.format == "image":
             from image_parser import answer_image_question
             result = answer_image_question(
-                question, document, model_path=self.count_model, geometry_model_path=self.geometry_model
+                question, document, model_path=self.count_model, geometry_model_path=self.geometry_model,
+                cubicasa_repo_path=self.cubicasa_repo,
+                cubicasa_weights_path=self.cubicasa_weights,
             )
         else:
             result = {"status": "unsupported", "answer": None, "evidence": [],
