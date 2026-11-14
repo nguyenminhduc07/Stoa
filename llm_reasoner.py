@@ -15,6 +15,7 @@ import json
 import math
 import os
 import re
+import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
@@ -1270,8 +1271,20 @@ _REASONING_OPENAI_SCHEMA = {
 
 
 def _call_gemini_reasoner(api_key: str, payload_json: str) -> Dict[str, Any]:
-    model = get_env_setting("STOA_LLM_MODEL") or get_env_setting("GEMINI_MODEL") or _DEFAULT_GEMINI_MODEL
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{urllib.parse.quote(model, safe='')}:generateContent"
+    configured = (get_env_setting("GEMINI_MODEL") or get_env_setting("STOA_LLM_MODEL") or _DEFAULT_GEMINI_MODEL).strip()
+    if configured.startswith("models/"):
+        configured = configured[len("models/"):]
+    if configured and not configured.startswith("gemini"):
+        configured = _DEFAULT_GEMINI_MODEL
+
+    models_to_try = list(dict.fromkeys([
+        configured or _DEFAULT_GEMINI_MODEL,
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
+        "gemini-2.5-flash-lite",
+        "gemini-1.5-flash",
+    ]))
+
     body = json.dumps({
         "systemInstruction": {"parts": [{"text": _REASONING_SYSTEM_PROMPT}]},
         "contents": [{"role": "user", "parts": [{"text": payload_json}]}],
@@ -1282,14 +1295,36 @@ def _call_gemini_reasoner(api_key: str, payload_json: str) -> Dict[str, Any]:
             "responseSchema": _REASONING_GEMINI_SCHEMA,
         },
     }).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=body,
-        headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=35.0) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
+
+    data: Optional[Dict[str, Any]] = None
+    last_error: Optional[str] = None
+    for model in models_to_try:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{urllib.parse.quote(model, safe='')}:generateContent"
+        req = urllib.request.Request(
+            url,
+            data=body,
+            headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=35.0) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            break
+        except urllib.error.HTTPError as exc:
+            err_body = ""
+            try:
+                err_body = exc.read().decode("utf-8", errors="ignore").strip()
+            except Exception:
+                pass
+            detail = err_body[:400] if err_body else exc.reason
+            last_error = f"HTTP {exc.code} for model '{model}': {detail}"
+            if exc.code == 404:
+                continue
+            raise RuntimeError(last_error) from exc
+
+    if data is None:
+        raise RuntimeError(last_error or "All Gemini model endpoints returned 404 Not Found.")
+
     candidates = data.get("candidates") or []
     if not candidates:
         raise ValueError("Gemini returned no candidates for evidence reasoning.")
