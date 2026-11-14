@@ -498,6 +498,11 @@ def answer_image_question(
 
         category = question_category(question)
         if category:
+            if category == "showers_bathtubs" and any(
+                    term in question.casefold() for term in ("shower", "suihku")):
+                return {"status": "not_found", "answer": None,
+                        "reason": "CubiCasa5K has a bathtub class but no shower class, so this question cannot be answered reliably.",
+                        "evidence": [evidence]}
             geometry = _cubicasa_prediction(source, cubicasa_repo_path, cubicasa_weights_path)
             class_for_category = {
                 "windows": ("icons", "Window"), "doors": ("icons", "Door"),
@@ -518,9 +523,10 @@ def answer_image_question(
                  "class": item["class"], "confidence": item["confidence"]}
                 for item in regions
             ] or [evidence]
+            answer_label = "bathtubs" if category == "showers_bathtubs" else category.replace("_", " ")
             return {
                 "status": "answered", "answer": len(regions),
-                "answer_text": f"{len(regions)} {category.replace('_', ' ')}",
+                "answer_text": f"{len(regions)} {answer_label}",
                 "method": "cubicasa5k_pretrained_segmentation_components",
                 "model": geometry["model"], "review_recommended": True,
                 "evidence": region_evidence,
