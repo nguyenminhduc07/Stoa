@@ -29,6 +29,7 @@ format: IFC > DXF > vector PDF > raster image.
 | `cad_qa.py` / `evaluate_cad.py` | DXF floor-plan answers (Swiss dwellings) + eval | Minh |
 | `evaluate_all.py` | routes every question to its answerer, one overall score | Minh |
 | `room_label_qa.py` | CubiCasa room-type counts from OCR of room labels | Minh |
+| `ifc_qa.py` | IFC element counts and wall/slab length, side area, volume | Minh |
 | _(add yours here)_ | | |
 | `conversation_pipeline.py` | per-conversation file manifest, parser cache, and question router | Codex |
 | `chat_api.py` | conversation-scoped REST upload and question API | Codex |
