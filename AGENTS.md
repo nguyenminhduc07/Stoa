@@ -25,6 +25,7 @@ format: IFC > DXF > vector PDF > raster image.
 | `evaluate_bim_area.py` | eval for IFC area questions | Duc |
 | `cad_parser.py` | DXF/DWG parsing (Swiss dwellings) | Duc |
 | `pdf_parser.py` / `evaluate_pdf_text.py` | PDF schedules + eval | Duc |
+| `image_parser.py`, `floorplan_model.py`, `floorplan_geometry_model.py`, `train_floorplan*.py`, `prepare_cubicasa_masks.py` | raster evidence and floor-plan CNNs | Codex |
 | `cad_qa.py` / `evaluate_cad.py` | DXF floor-plan answers (Swiss dwellings) + eval | Minh |
 | `evaluate_all.py` | routes every question to its answerer, one overall score | Minh |
 | `room_label_qa.py` | CubiCasa room-type counts from OCR of room labels | Minh |
