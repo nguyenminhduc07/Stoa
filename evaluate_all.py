@@ -4,7 +4,8 @@ Routing (most exact format first, per AGENTS.md):
   IFC model, or a plan PDF rendered from one  -> bim_parser + bim_qa   (area questions)
   DXF twin with the same stem                  -> cad_qa
   PDF                                          -> pdf_parser
-  raster image                                 -> image_parser (needs --image-model for counts)
+  raster image, room-type question             -> room_label_qa (OCR of room labels)
+  raster image, symbol count                   -> image_parser (needs --image-model)
 
 Grading follows the dataset README: counts exact, area/length/volume within 2%,
 text by normalised containment (same rule as evaluate_pdf_text.py).
@@ -122,6 +123,11 @@ class Router:
             from pdf_parser import answer_pdf_question, parse_pdf
             return "pdf", answer_pdf_question(question, self._cached("pdf", path, parse_pdf))
         if suffix in IMAGE_EXTENSIONS:
+            from room_label_qa import SUPPORTED, answer_room_question
+            from train_floorplan_model import question_category
+            category = question_category(question)
+            if category in SUPPORTED:
+                return "image-ocr", answer_room_question(question, path, category)
             from image_parser import answer_image_question, parse_image
             document = self._cached("image", path, lambda p: parse_image(p, run_ocr=False))
             return "image", answer_image_question(question, document, model_path=self.image_model)

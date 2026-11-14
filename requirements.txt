@@ -2,6 +2,8 @@ ifcopenshell
 ezdxf
 pdfplumber
 Pillow
+numpy
+rapidocr_onnxruntime
 # optional, only for CLIP image routing in file_classifier.py:
 # transformers
 # torch

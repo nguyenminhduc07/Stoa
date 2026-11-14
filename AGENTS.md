@@ -27,6 +27,7 @@ format: IFC > DXF > vector PDF > raster image.
 | `pdf_parser.py` / `evaluate_pdf_text.py` | PDF schedules + eval | Duc |
 | `cad_qa.py` / `evaluate_cad.py` | DXF floor-plan answers (Swiss dwellings) + eval | Minh |
 | `evaluate_all.py` | routes every question to its answerer, one overall score | Minh |
+| `room_label_qa.py` | CubiCasa room-type counts from OCR of room labels | Minh |
 | _(add yours here)_ | | |
 
 Only edit files you own. If you must change someone else's file, keep the diff minimal and
