@@ -12,7 +12,7 @@ import tempfile
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Literal, Optional
 from uuid import uuid4
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
@@ -37,6 +37,10 @@ class SessionRecord:
 class QuestionRequest(BaseModel):
     question: str = Field(min_length=1, max_length=4000)
     file_id: Optional[str] = None
+
+
+class DrawingTypeRequest(BaseModel):
+    drawing_type: Literal["floor_plan", "elevation", "section", "detail", "site_plan", "map", "other", "uncertain"]
 
 
 app = FastAPI(title="Stoa Drawing QA", version="0.1.0")
@@ -149,6 +153,18 @@ def upload_files(conversation_id: str, files: List[UploadFile] = File(...)):
 @app.get("/conversations/{conversation_id}/files")
 def list_files(conversation_id: str):
     return {"files": _public_manifest(_session(conversation_id))}
+
+
+@app.patch("/conversations/{conversation_id}/files/{file_id}")
+def set_drawing_type(conversation_id: str, file_id: str, request: DrawingTypeRequest):
+    record = _session(conversation_id)
+    try:
+        item = record.pipeline.set_drawing_type(file_id, request.drawing_type)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {key: value for key, value in item.items() if key != "path"}
 
 
 @app.post("/conversations/{conversation_id}/questions")

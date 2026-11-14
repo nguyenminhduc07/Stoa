@@ -285,6 +285,23 @@ class ConversationPipeline:
                 entry.parse_error = f"{type(exc).__name__}: {exc}"
                 raise
 
+    def set_drawing_type(self, file_id: str, drawing_type: str) -> Dict[str, Any]:
+        """Apply a user-confirmed image type and invalidate its parsed cache."""
+        allowed = {"floor_plan", "elevation", "section", "detail", "site_plan", "map", "other", "uncertain"}
+        if drawing_type not in allowed:
+            raise ValueError(f"Unsupported drawing_type: {drawing_type}")
+        with self._lock:
+            entry = self.files.get(file_id)
+            if entry is None:
+                raise KeyError(f"Unknown file_id: {file_id}")
+            if entry.format != "image":
+                raise ValueError("Only uploaded raster images have a drawing type")
+            entry.drawing_type = drawing_type
+            entry.parsed = None
+            entry.parse_status = "not_parsed"
+            entry.parse_error = None
+            return self._manifest_entry(file_id)
+
     def retry_parse(self, file_id: str) -> None:
         """Clear a cached parse failure so the caller can retry after setup changes."""
         with self._lock:
