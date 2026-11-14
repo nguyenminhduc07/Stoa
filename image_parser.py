@@ -1,4 +1,4 @@
-"""Read raster drawings and answer floor-plan count questions with a CNN."""
+"""Parse raster technical drawings and answer grounded OCR or floor-plan questions."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import math
 import re
 import struct
 import sys
+import unicodedata
 from typing import Any, Dict, List, Optional, Tuple
 
 from floorplan_model import CATEGORY_NAMES, MODEL_VERSION, SharedFloorplanCounter, require_torch
@@ -24,6 +25,11 @@ SUPPORTED_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 _COUNT_MODEL_CACHE: Dict[str, Tuple[Any, Any, int]] = {}
 _GEOMETRY_MODEL_CACHE: Dict[str, Tuple[Any, Any, Any]] = {}
 _CUBICASA_MODEL_CACHE: Dict[Tuple[str, str], Tuple[Any, Any, Any]] = {}
+_RAPID_OCR = None
+_DIMENSION_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9])(?:\d{1,3}(?:[ ,]\d{3})+|\d+)(?:[.,]\d+)?\s*(?:mm|cm|ft|feet|inches|inch|in|m)(?![A-Za-z])",
+    re.IGNORECASE,
+)
 
 
 def _png_dimensions(data: bytes) -> Optional[Tuple[int, int]]:
@@ -93,31 +99,115 @@ def _drawing_type(path: Path) -> str:
 
 
 def _ocr(path: Path) -> Tuple[str, List[Dict[str, Any]]]:
-    """Run Tesseract OCR when both pytesseract and its executable are present."""
+    """Read raster drawing text with RapidOCR, falling back to Tesseract."""
+    global _RAPID_OCR
     try:
-        from PIL import Image
-        import pytesseract
+        import numpy as np
+        from PIL import Image, ImageOps
+        from rapidocr_onnxruntime import RapidOCR
+
+        if _RAPID_OCR is None:
+            _RAPID_OCR = RapidOCR()
+        with Image.open(path) as source:
+            image = np.asarray(ImageOps.exif_transpose(source).convert("RGB"))
+        result, _elapsed = _RAPID_OCR(image)
+        words = []
+        for detection in result or []:
+            box, text, confidence = detection
+            text = str(text).strip()
+            if not text:
+                continue
+            points = np.asarray(box, dtype=float).reshape(-1, 2)
+            x0, y0 = np.floor(points.min(axis=0)).astype(int)
+            x1, y1 = np.ceil(points.max(axis=0)).astype(int)
+            words.append({
+                "text": text, "confidence": float(confidence),
+                "bbox": [int(x0), int(y0), int(x1), int(y1)], "page": 1,
+            })
+        return "available", words
     except ImportError:
-        return "unavailable", []
-    try:
-        data = pytesseract.image_to_data(Image.open(path), output_type=pytesseract.Output.DICT)
+        # Keep a fallback for local environments that have Tesseract installed
+        # but have not yet installed RapidOCR's ONNX runtime.
+        try:
+            from PIL import Image, ImageOps
+            import pytesseract
+        except ImportError:
+            return "unavailable", []
+        try:
+            with Image.open(path) as source:
+                image = ImageOps.exif_transpose(source)
+                data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT)
+        except Exception as exc:
+            return f"failed: {type(exc).__name__}: {exc}", []
+        words = []
+        for i, value in enumerate(data.get("text", [])):
+            text = str(value).strip()
+            if not text:
+                continue
+            left, top = int(data["left"][i]), int(data["top"][i])
+            width, height = int(data["width"][i]), int(data["height"][i])
+            words.append({
+                "text": text, "confidence": float(data["conf"][i]),
+                "bbox": [left, top, left + width, top + height], "page": 1,
+            })
+        return "available", words
     except Exception as exc:
         return f"failed: {type(exc).__name__}: {exc}", []
 
-    words = []
-    for i, value in enumerate(data.get("text", [])):
-        text = str(value).strip()
-        if not text:
-            continue
-        left, top = int(data["left"][i]), int(data["top"][i])
-        width, height = int(data["width"][i]), int(data["height"][i])
-        words.append({
+
+def _ocr_lines(words: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Group word detections into reading lines while retaining pixel boxes."""
+    ordered = sorted(words, key=lambda word: (
+        (word["bbox"][1] + word["bbox"][3]) / 2, word["bbox"][0]
+    ))
+    clusters: List[List[Dict[str, Any]]] = []
+    for word in ordered:
+        x0, y0, x1, y1 = word["bbox"]
+        center = (y0 + y1) / 2
+        height = max(1, y1 - y0)
+        candidates = []
+        for index, cluster in enumerate(clusters):
+            centers = [(item["bbox"][1] + item["bbox"][3]) / 2 for item in cluster]
+            heights = [max(1, item["bbox"][3] - item["bbox"][1]) for item in cluster]
+            tolerance = max(5, 0.55 * max(height, sum(heights) / len(heights)))
+            distance = abs(center - sum(centers) / len(centers))
+            if distance <= tolerance:
+                candidates.append((distance, index))
+        if candidates:
+            clusters[min(candidates)[1]].append(word)
+        else:
+            clusters.append([word])
+
+    lines = []
+    for cluster in clusters:
+        cluster.sort(key=lambda word: word["bbox"][0])
+        boxes = [word["bbox"] for word in cluster]
+        text = " ".join(word["text"] for word in cluster)
+        lines.append({
             "text": text,
-            "confidence": float(data["conf"][i]),
-            "bbox": [left, top, left + width, top + height],
-            "page": 1,
+            "bbox": [min(box[0] for box in boxes), min(box[1] for box in boxes),
+                     max(box[2] for box in boxes), max(box[3] for box in boxes)],
+            "confidence": round(sum(float(word["confidence"]) for word in cluster) / len(cluster), 4),
         })
-    return "available", words
+    return sorted(lines, key=lambda line: (line["bbox"][1], line["bbox"][0]))
+
+
+def _fold_text(text: str) -> str:
+    value = unicodedata.normalize("NFKD", str(text)).casefold().replace(chr(248), "o").replace(chr(230), "ae")
+    return "".join(character for character in value if not unicodedata.combining(character))
+
+
+def _drawing_metadata(lines: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    patterns = {
+        "scale": re.compile(r"\b(?:scale|massstab|echelle|mittakaava|mootkava|maalestok)\b|(?<!\d)1\s*[:/]\s*\d{2,4}", re.I),
+        "drawing_number": re.compile(r"\b(?:drawing|sheet|plan)\s*(?:number|no\.?|#)|\b(?:blattnummer|plannummer|lehenr|piirustusnumero|tegningsnr|zeichnungsnummer|numero de dessin)\b", re.I),
+        "date": re.compile(r"\b(?:date|datum|drawn|paivays)\b|\b\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\b", re.I),
+        "title": re.compile(r"\b(?:drawing\s+title|project\s+name|sheet\s+title|title|titel|titre|projektin nimi|piirustuksen nimi)\b", re.I),
+    }
+    return {
+        kind: [line for line in lines if pattern.search(_fold_text(line["text"]))]
+        for kind, pattern in patterns.items()
+    }
 
 
 def parse_image(file_path: str | Path, *, run_ocr: bool = True) -> Dict[str, Any]:
@@ -129,6 +219,11 @@ def parse_image(file_path: str | Path, *, run_ocr: bool = True) -> Dict[str, Any
         raise ValueError(f"Unsupported image extension: {path.suffix or '(none)'}")
     width, height = _dimensions(path)
     ocr_status, words = _ocr(path) if run_ocr else ("skipped", [])
+    lines = _ocr_lines(words)
+    measurements = [
+        {"text": match.group(0), "bbox": line["bbox"], "confidence": line["confidence"], "page": 1}
+        for line in lines for match in _DIMENSION_PATTERN.finditer(line["text"])
+    ]
     return {
         "source": {"path": str(path), "format": path.suffix.lstrip(".").upper()},
         "drawing_type": _drawing_type(path),
@@ -136,6 +231,9 @@ def parse_image(file_path: str | Path, *, run_ocr: bool = True) -> Dict[str, Any
         "height": height,
         "ocr_status": ocr_status,
         "text": words,
+        "lines": lines,
+        "measurements": measurements,
+        "drawing_metadata": _drawing_metadata(lines),
         "evidence_region": {
             "page": 1,
             "bbox": [0, 0, width, height],
@@ -455,6 +553,77 @@ def _cubicasa_prediction(image_path: str | Path, repo_path: str | Path, weights_
         "model": "CubiCasa5K model_best_val_loss_var",
     }
 
+
+def _answer_raster_text_question(question: str, document: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Answer only text/metadata questions grounded in OCR line evidence."""
+    source = document.get("source", {}).get("path")
+    lines = document.get("lines", [])
+    metadata = document.get("drawing_metadata", {})
+    normalized_question = _fold_text(question)
+
+    def result_for(line: Dict[str, Any], method: str, answer: Optional[str] = None):
+        return {
+            "status": "answered", "answer": answer if answer is not None else line["text"],
+            "method": method,
+            "evidence": [{"source": source, "page": 1, "bbox": line["bbox"],
+                          "coordinate_system": "image pixels; origin at top-left",
+                          "ocr_text": line["text"], "ocr_confidence": line["confidence"]}],
+        }
+
+    quoted = re.search(r"[\"'](.+?)[\"']|[\u2018\u201c](.+?)[\u2019\u201d]", question)
+    if quoted:
+        target = _fold_text(quoted.group(1) or quoted.group(2)).strip()
+        for line in lines:
+            if target and target in _fold_text(line["text"]):
+                return result_for(line, "raster_ocr_exact_text")
+
+    metadata_questions = {
+        "scale": ("scale", "massstab", "echelle", "mittakaava", "mootkava", "maalestok"),
+        "drawing_number": ("drawing number", "drawing no", "sheet number", "sheet no", "plan number", "plan no", "lehe number", "blattnummer", "piirustusnumero", "tegningsnr", "zeichnungsnummer", "numero de dessin"),
+        "date": ("date", "datum", "drawn on", "paivays"),
+        "title": ("drawing title", "sheet title", "project name", "title of the drawing", "titre du dessin", "projektin nimi", "piirustuksen nimi"),
+    }
+    for kind, terms in metadata_questions.items():
+        if any(term in normalized_question for term in terms):
+            matches = metadata.get(kind, [])
+            if matches:
+                line = matches[0]
+                return result_for(line, f"raster_ocr_{kind}")
+
+    dimension_terms = ("width", "height", "length", "diameter", "breite", "hohe", "longueur", "largeur", "hauteur", "leveys", "korkeus", "pituus", "breedte", "hoogte")
+    asks_dimension = any(term in normalized_question for term in (
+        "dimension", "dimensions", *dimension_terms, "measurement", "size"
+    ))
+    if asks_dimension:
+        candidates = document.get("measurements", [])
+        if candidates:
+            dimension_lines = [line for line in lines if _DIMENSION_PATTERN.search(line["text"])]
+            question_terms = [term for term in dimension_terms if term in normalized_question]
+            if question_terms:
+                # Only answer a named dimension when OCR links its label and
+                # value on the same line; otherwise abstain instead of guessing.
+                selected = [line for line in dimension_lines
+                            if any(term in _fold_text(line["text"]) for term in question_terms)][:5]
+                if not selected:
+                    return {"status": "not_found", "answer": None,
+                            "reason": "No printed value linked to that named dimension was found.",
+                            "evidence": []}
+            else:
+                selected = dimension_lines[:5]
+            return {
+                "status": "answered", "answer": [line["text"] for line in selected],
+                "method": "raster_ocr_printed_dimensions",
+                "evidence": [{"source": source, "page": 1, "bbox": line["bbox"],
+                              "coordinate_system": "image pixels; origin at top-left",
+                              "ocr_text": line["text"], "ocr_confidence": line["confidence"]}
+                             for line in selected],
+            }
+
+    if any(term in normalized_question for term in ("what text", "read the text", "what label", "read the label")):
+        return {"status": "not_found", "answer": None,
+                "reason": "No matching quoted label was found in the OCR text.", "evidence": []}
+    return None
+
 def answer_image_question(
     question: str,
     document: Dict[str, Any],
@@ -491,6 +660,10 @@ def answer_image_question(
                     "answer": " ".join(word["text"] for word in found),
                     "evidence": [{**evidence, "bbox": found[0].get("bbox"), "ocr_words": found}],
                 }
+
+    text_answer = _answer_raster_text_question(question, document)
+    if text_answer is not None:
+        return text_answer
 
     if (cubicasa_repo_path is not None and cubicasa_weights_path is not None
             and document.get("drawing_type") == "floor_plan"):
@@ -619,9 +792,9 @@ def answer_image_question(
         "status": "unsupported",
         "answer": None,
         "reason": (
-            "This image question needs visual reasoning. Configure the CubiCasa5K "
-            "checkout and pretrained weights (STOA_CUBICASA_REPO and "
-            "STOA_CUBICASA_WEIGHTS) to answer supported floor-plan counts."
+            "This raster parser can answer OCR text, drawing metadata, and printed-dimension "
+            "lookups. Symbol counts and geometry-derived quantities for this drawing class "
+            "need a dedicated vision parser; no reliable matching evidence was found."
         ),
         "evidence": [evidence],
     }
