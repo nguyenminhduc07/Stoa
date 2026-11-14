@@ -25,6 +25,7 @@ SUPPORTED_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 _COUNT_MODEL_CACHE: Dict[str, Tuple[Any, Any, int]] = {}
 _GEOMETRY_MODEL_CACHE: Dict[str, Tuple[Any, Any, Any]] = {}
 _CUBICASA_MODEL_CACHE: Dict[Tuple[str, str], Tuple[Any, Any, Any]] = {}
+_CUBICASA_PREDICTION_CACHE: Dict[Tuple[str, str, str, int, int], Dict[str, Any]] = {}
 _OBJECT_DETECTOR_CACHE: Dict[str, Any] = {}
 _RAPID_OCR = None
 _DIMENSION_PATTERN = re.compile(
@@ -508,7 +509,15 @@ def _cubicasa_prediction(image_path: str | Path, repo_path: str | Path, weights_
     except ImportError as exc:
         raise RuntimeError("CubiCasa inference requires Pillow: pip install pillow") from exc
 
-    model, device, _checkpoint = _load_cubicasa_model(repo_path, weights_path)
+    image_file = Path(image_path).expanduser().resolve()
+    repo = str(Path(repo_path).expanduser().resolve())
+    weights = str(Path(weights_path).expanduser().resolve())
+    stat = image_file.stat()
+    key = (str(image_file), repo, weights, stat.st_size, stat.st_mtime_ns)
+    if key in _CUBICASA_PREDICTION_CACHE:
+        return _CUBICASA_PREDICTION_CACHE[key]
+
+    model, device, _checkpoint = _load_cubicasa_model(repo, weights)
     with Image.open(image_path) as source_image:
         image = ImageOps.exif_transpose(source_image).convert("RGB")
         original_width, original_height = image.size
@@ -560,11 +569,17 @@ def _cubicasa_prediction(image_path: str | Path, repo_path: str | Path, weights_
                 })
         return result
 
-    return {
+    prediction = {
         "rooms": regions(room_prob, room_classes, 12, room=True),
         "icons": regions(icon_prob, icon_classes, 3),
         "model": "CubiCasa5K model_best_val_loss_var",
     }
+    # Keep the parsed box summary rather than segmentation tensors so many
+    # question rows for the same drawing reuse one inference with modest memory.
+    if len(_CUBICASA_PREDICTION_CACHE) >= 1024:
+        _CUBICASA_PREDICTION_CACHE.pop(next(iter(_CUBICASA_PREDICTION_CACHE)))
+    _CUBICASA_PREDICTION_CACHE[key] = prediction
+    return prediction
 
 
 def _answer_raster_text_question(question: str, document: Dict[str, Any]) -> Optional[Dict[str, Any]]:
