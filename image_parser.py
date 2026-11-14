@@ -724,6 +724,7 @@ def answer_image_question(
     cubicasa_repo_path: str | Path | None = None,
     cubicasa_weights_path: str | Path | None = None,
     object_detector_model: str | Path | None = None,
+    query_plan: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     """Answer OCR lookups or learned image-level count questions.
 
@@ -767,6 +768,66 @@ def answer_image_question(
         return {"status": "unsupported", "answer": None,
                 "reason": "This drawing type has OCR support, but no configured detector supports this question.",
                 "evidence": []}
+
+    if query_plan and query_plan.get("intent") == "count" and query_plan.get("target") in {"rooms", "spaces"}:
+        if drawing_type != "floor_plan":
+            return {
+                "status": "unsupported", "answer": None,
+                "reason": "A total room count needs this image to be identified as a floor plan.",
+                "evidence": [evidence],
+            }
+        scope = str(query_plan.get("scope") or "").casefold()
+        whole_drawing_scopes = (
+            "this floor plan", "current floor plan", "this plan", "whole plan", "entire plan",
+            "this drawing", "whole drawing", "entire drawing", "current drawing", "this floor",
+        )
+        if scope and not any(term in scope for term in whole_drawing_scopes):
+            return {
+                "status": "unsupported", "answer": None,
+                "reason": "The image parser cannot isolate a room count to the requested sub-area or level yet.",
+                "evidence": [evidence],
+            }
+        if cubicasa_repo_path is not None and cubicasa_weights_path is not None:
+            geometry = _cubicasa_prediction(source, cubicasa_repo_path, cubicasa_weights_path)
+            regions = geometry["rooms"]
+            model_name = geometry["model"]
+            method = "cubicasa5k_indoor_room_segmentation_components"
+        elif geometry_model_path is not None:
+            geometry = _geometry_prediction(source, geometry_model_path)
+            excluded = {"background", "outdoor", "wall", "railing"}
+            regions = [item for item in geometry["rooms"]
+                       if str(item.get("class", "")).casefold() not in excluded]
+            model_name = "floorplan_geometry_checkpoint"
+            method = "shared_geometry_indoor_room_components"
+        else:
+            return {
+                "status": "unsupported", "answer": None,
+                "reason": (
+                    "Total room counts need the CubiCasa5K checkpoint or the trained geometry model. "
+                    "Configure STOA_CUBICASA_REPO and STOA_CUBICASA_WEIGHTS, then restart the server."
+                ),
+                "evidence": [evidence],
+            }
+
+        if not regions:
+            return {
+                "status": "not_found", "answer": None,
+                "reason": "The segmentation model returned no indoor room regions; this does not establish a count of zero.",
+                "method": method, "model": model_name, "review_recommended": True,
+                "evidence": [evidence],
+            }
+        region_evidence = [
+            {"source": source, "page": 1, "bbox": item["bbox"],
+             "coordinate_system": "image pixels; origin at top-left",
+             "class": item.get("class"), "confidence": item.get("confidence")}
+            for item in regions
+        ]
+        return {
+            "status": "answered", "answer": len(regions), "unit": "count",
+            "answer_text": f"{len(regions)} indoor room regions",
+            "method": method, "model": model_name, "review_recommended": True,
+            "evidence": region_evidence,
+        }
 
     if (cubicasa_repo_path is not None and cubicasa_weights_path is not None
             and document.get("drawing_type") == "floor_plan"):

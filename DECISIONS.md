@@ -16,3 +16,4 @@
 - 2026-11-14 - Raster-only PDF pages with fewer than five embedded words and at least one image use shared RapidOCR; OCR coordinates are scaled to page coordinates and symbol counts remain unsupported.
 - 2026-11-14 - DWG count/area questions use ezdxf ODA conversion followed by the existing layer-based CAD answerer; files without supported semantic layers remain unanswerable.
 - 2026-11-14 - Non-floor-plan object counts may use opt-in Transformers zero-shot object detection configured by STOA_OBJECT_DETECTOR_MODEL; responses include detected boxes and require human review because natural-image detectors are not validated on technical drawings.
+- 2026-11-14 - OpenAI function calling may normalize a question into a constrained drawing query plan; uploaded drawing contents stay local, and only parser answers with local evidence are returned.

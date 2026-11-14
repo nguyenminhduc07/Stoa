@@ -24,6 +24,10 @@ _FORMAT_PRIORITY = {"ifc": 0, "dxf": 1, "dwg": 1, "pdf": 2, "image": 3}
 _AREA_TERMS = ("area", "surface", "superficie", "flache", "areal", "pinta-ala", "pindala")
 _COUNT_TERMS = ("how many", "number of", "count", "combien", "nombre de", "wie viele", "anzahl",
                 "quante", "quanti", "cuantos", "cuantas", "kuinka monta", "montako", "hvor mange", "mitu", "how much")
+_INTENT_BY_PLAN = {
+    "count": "count", "area": "area", "length": "length", "volume": "volume",
+    "lookup": "text", "describe": "text", "compare": "text", "other": "text",
+}
 
 
 @dataclass
@@ -254,7 +258,7 @@ class ConversationPipeline:
         candidates = [self.files[file_id] for file_id in group_ids]
         supported = []
         for item in candidates:
-            if item.format == "ifc" and intent == "area":
+            if item.format == "ifc" and intent in {"area", "length", "volume", "count", "text"}:
                 supported.append((0, item))
             elif item.format == "dxf" and intent in {"area", "count"}:
                 supported.append((1, item))
@@ -334,7 +338,41 @@ class ConversationPipeline:
         if error is not None:
             return error
         assert groups is not None
-        intent = self._intent(question)
+        plan = None
+        planner_error = None
+        try:
+            from llm_query_planner import plan_question
+            group_formats = [self.files[item].format for item in groups]
+            plan = plan_question(question, group_formats)
+        except Exception as exc:
+            # The LLM improves interpretation but must never prevent the
+            # existing deterministic route from answering a question.
+            planner_error = type(exc).__name__
+        intent = _INTENT_BY_PLAN.get(plan.intent, "text") if plan else self._intent(question)
+        parser_question = plan.canonical_question if plan else question
+        interpretation = {
+            "planner": "openai_function_call" if plan else "keyword_fallback",
+            "status": "planned" if plan else ("fallback" if planner_error else "not_configured"),
+            "intent": plan.intent if plan else intent,
+            "target": plan.target if plan else None,
+            "scope": plan.scope if plan else None,
+            "fallback_reason": planner_error,
+        }
+        if plan and plan.clarification_question:
+            return {
+                "status": "clarification_required", "answer": plan.clarification_question,
+                "reason": "The question needs one more detail before it can be checked against the drawing.",
+                "evidence": [], "query_interpretation": interpretation,
+            }
+        if plan and plan.filters:
+            return {
+                "status": "unsupported", "answer": None,
+                "reason": (
+                    "The question includes a condition the current drawing query executors do not "
+                    "apply yet, so I am not returning an unfiltered result."
+                ),
+                "evidence": [], "query_interpretation": interpretation,
+            }
         entry = self._select_file(groups, intent)
         try:
             document = self._parse(entry)
@@ -343,44 +381,46 @@ class ConversationPipeline:
                 "status": "not_found", "answer": None,
                 "reason": f"Could not parse {entry.path.name}: {type(exc).__name__}: {exc}",
                 "evidence": [], "file_id": entry.file_id,
+                "query_interpretation": interpretation,
             }
 
         if entry.format == "ifc":
             if intent == "area":
                 from bim_qa import answer_area_question
-                result = answer_area_question(question, document)
+                result = answer_area_question(parser_question, document)
             else:
                 from ifc_qa import IfcIndex, answer_ifc_question, answer_ifc_text_question
                 if entry.ifc_index is None:
                     entry.ifc_index = IfcIndex(str(entry.path))
                 text_first = intent == "text" or (
-                    intent == "count" and any(term in question.casefold() for term in ("type", "types", "breakdown", "distribution"))
+                    intent == "count" and any(term in parser_question.casefold() for term in ("type", "types", "breakdown", "distribution"))
                 )
                 if text_first:
-                    result = answer_ifc_text_question(question, entry.ifc_index)
+                    result = answer_ifc_text_question(parser_question, entry.ifc_index)
                     if result.get("status") == "unsupported":
-                        result = answer_ifc_question(question, entry.ifc_index)
+                        result = answer_ifc_question(parser_question, entry.ifc_index)
                 else:
-                    result = answer_ifc_question(question, entry.ifc_index)
+                    result = answer_ifc_question(parser_question, entry.ifc_index)
                     if result.get("status") == "unsupported":
-                        result = answer_ifc_text_question(question, entry.ifc_index)
+                        result = answer_ifc_text_question(parser_question, entry.ifc_index)
         elif entry.format in {"dxf", "dwg"}:
             if intent not in {"area", "count"}:
                 result = {"status": "unsupported", "answer": None,
                           "reason": "The CAD answerer currently supports count and area questions.", "evidence": []}
             else:
                 from cad_qa import answer_cad_question
-                result = answer_cad_question(question, document)
+                result = answer_cad_question(parser_question, document)
         elif entry.format == "pdf":
             from pdf_parser import answer_pdf_question
-            result = answer_pdf_question(question, document)
+            result = answer_pdf_question(parser_question, document)
         elif entry.format == "image":
             from image_parser import answer_image_question
             result = answer_image_question(
-                question, document, model_path=self.count_model, geometry_model_path=self.geometry_model,
+                parser_question, document, model_path=self.count_model, geometry_model_path=self.geometry_model,
                 cubicasa_repo_path=self.cubicasa_repo,
                 cubicasa_weights_path=self.cubicasa_weights,
                 object_detector_model=self.object_detector_model,
+                query_plan=plan.public() if plan else None,
             )
         else:
             result = {"status": "unsupported", "answer": None, "evidence": [],
@@ -392,6 +432,7 @@ class ConversationPipeline:
         result["format"] = entry.format
         result["drawing_type"] = entry.drawing_type
         result["related_files"] = [self.files[item].path.name for item in groups if item != entry.file_id]
+        result["query_interpretation"] = interpretation
         return result
 
     def close(self) -> None:

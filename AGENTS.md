@@ -33,6 +33,7 @@ format: IFC > DXF > vector PDF > raster image.
 | _(add yours here)_ | | |
 | `conversation_pipeline.py` | per-conversation file manifest, parser cache, and question router | Codex |
 | `chat_api.py` | conversation-scoped REST upload and question API | Codex |
+| `llm_query_planner.py` | optional LLM query planning with schema validation | Codex |
 
 Only edit files you own. If you must change someone else's file, keep the diff minimal and
 say so in the PR description.

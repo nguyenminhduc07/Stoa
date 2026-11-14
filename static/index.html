@@ -279,6 +279,13 @@
         if (result.format) meta.append(make('span', 'chip', String(result.format).toUpperCase()));
         if (result.method) meta.append(make('span', 'chip', result.method));
         if (result.review_recommended) meta.append(make('span', 'chip', 'Human review recommended'));
+        if (result.query_interpretation) {
+          const plan = result.query_interpretation;
+          const label = plan.planner === 'openai_function_call'
+            ? `LLM plan · ${plan.intent}${plan.target ? ` ${plan.target}` : ''}${plan.scope ? ` · ${plan.scope}` : ''}`
+            : `Keyword fallback · ${plan.status === 'not_configured' ? 'LLM not configured' : 'LLM unavailable'}`;
+          meta.append(make('span', 'chip', label));
+        }
         if (meta.childNodes.length) card.append(meta);
         if (status === 'clarification_required' && Array.isArray(result.options)) {
           const options = make('div', 'option-list');

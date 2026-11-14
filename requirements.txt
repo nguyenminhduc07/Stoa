@@ -14,3 +14,4 @@ transformers
 fastapi
 python-multipart
 uvicorn[standard]
+openai>=1.66.0
