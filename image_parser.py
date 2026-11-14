@@ -25,6 +25,7 @@ SUPPORTED_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 _COUNT_MODEL_CACHE: Dict[str, Tuple[Any, Any, int]] = {}
 _GEOMETRY_MODEL_CACHE: Dict[str, Tuple[Any, Any, Any]] = {}
 _CUBICASA_MODEL_CACHE: Dict[Tuple[str, str], Tuple[Any, Any, Any]] = {}
+_OBJECT_DETECTOR_CACHE: Dict[str, Any] = {}
 _RAPID_OCR = None
 _DIMENSION_PATTERN = re.compile(
     r"(?<![A-Za-z0-9])(?:\d{1,3}(?:[ ,]\d{3})+|\d+)(?:[.,]\d+)?\s*(?:mm|cm|ft|feet|inches|inch|in|m)(?![A-Za-z])",
@@ -636,6 +637,69 @@ def _answer_raster_text_question(question: str, document: Dict[str, Any]) -> Opt
                 "reason": "No matching quoted label was found in the OCR text.", "evidence": []}
     return None
 
+
+def _answer_raster_object_count(
+    question: str, document: Dict[str, Any], model_id: str | Path
+) -> Optional[Dict[str, Any]]:
+    """Try an optional zero-shot box detector for countable drawing symbols."""
+    normalized = _fold_text(question)
+    if not any(term in normalized for term in ("how many", "count", "number of", "quantity of")):
+        return None
+    labels = (
+        ("windows", ("window", "windows", "fenster", "fenetre")),
+        ("doors", ("door", "doors", "porte", "tuer")),
+        ("stairs", ("stair", "stairs", "staircase", "staircases")),
+        ("columns", ("column", "columns", "pillar", "pillars")),
+        ("beams", ("beam", "beams", "girder", "girders")),
+        ("trees", ("tree", "trees")),
+        ("cars", ("car", "cars", "vehicle", "vehicles")),
+    )
+    match = next(((label, terms) for label, terms in labels
+                  if any(re.search(rf"\b{re.escape(term)}\b", normalized) for term in terms)), None)
+    if match is None:
+        return None
+    label, _terms = match
+    model_key = str(model_id)
+    try:
+        detector = _OBJECT_DETECTOR_CACHE.get(model_key)
+        if detector is None:
+            from transformers import pipeline
+            device = 0 if require_torch().cuda.is_available() else -1
+            detector = pipeline("zero-shot-object-detection", model=model_key, device=device)
+            _OBJECT_DETECTOR_CACHE[model_key] = detector
+        from PIL import Image
+        source = document.get("source", {}).get("path")
+        if not source:
+            return {"status": "not_found", "answer": None,
+                    "reason": "The parsed drawing has no source image path.", "evidence": []}
+        with Image.open(source) as stream:
+            image = stream.convert("RGB")
+        detections = detector(image, candidate_labels=[label])
+    except Exception as exc:
+        return {"status": "not_found", "answer": None,
+                "reason": f"Object detector could not run: {type(exc).__name__}: {exc}", "evidence": []}
+
+    accepted = [item for item in detections if float(item.get("score", 0.0)) >= 0.35]
+    if not accepted:
+        return {"status": "not_found", "answer": None,
+                "reason": f"The detector found no {label} boxes above its confidence threshold; this does not establish a count of zero.",
+                "method": "grounding_dino_zero_shot", "model": model_key,
+                "review_recommended": True, "evidence": []}
+    evidence = []
+    for item in accepted:
+        box = item.get("box", {})
+        evidence.append({
+            "source": source, "page": 1,
+            "bbox": [int(box.get("xmin", 0)), int(box.get("ymin", 0)),
+                     int(box.get("xmax", 0)), int(box.get("ymax", 0))],
+            "coordinate_system": "image pixels; origin at top-left",
+            "class": item.get("label", label), "confidence": float(item.get("score", 0.0)),
+        })
+    return {"status": "answered", "answer": len(accepted),
+            "answer_text": f"{len(accepted)} detected {label}",
+            "method": "grounding_dino_zero_shot", "model": model_key,
+            "review_recommended": True, "evidence": evidence}
+
 def answer_image_question(
     question: str,
     document: Dict[str, Any],
@@ -644,6 +708,7 @@ def answer_image_question(
     geometry_model_path: str | Path | None = None,
     cubicasa_repo_path: str | Path | None = None,
     cubicasa_weights_path: str | Path | None = None,
+    object_detector_model: str | Path | None = None,
 ) -> Dict[str, Any]:
     """Answer OCR lookups or learned image-level count questions.
 
@@ -676,6 +741,17 @@ def answer_image_question(
     text_answer = _answer_raster_text_question(question, document)
     if text_answer is not None:
         return text_answer
+
+    drawing_type = document.get("drawing_type")
+    if object_detector_model and drawing_type not in {"floor_plan", "uncertain", None}:
+        detected = _answer_raster_object_count(question, document, object_detector_model)
+        if detected is not None:
+            return detected
+
+    if drawing_type not in {"floor_plan", "uncertain", None}:
+        return {"status": "unsupported", "answer": None,
+                "reason": "This drawing type has OCR support, but no configured detector supports this question.",
+                "evidence": []}
 
     if (cubicasa_repo_path is not None and cubicasa_weights_path is not None
             and document.get("drawing_type") == "floor_plan"):
