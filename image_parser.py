@@ -32,6 +32,33 @@ _DIMENSION_PATTERN = re.compile(
 )
 
 
+def ocr_image_array(image: Any) -> Tuple[str, List[Dict[str, Any]]]:
+    """Run the shared RapidOCR engine on an RGB array and return pixel boxes."""
+    global _RAPID_OCR
+    try:
+        import numpy as np
+        from rapidocr_onnxruntime import RapidOCR
+        if _RAPID_OCR is None:
+            _RAPID_OCR = RapidOCR()
+        result, _elapsed = _RAPID_OCR(np.asarray(image))
+        words = []
+        for detection in result or []:
+            box, text, confidence = detection
+            text = str(text).strip()
+            if not text:
+                continue
+            points = np.asarray(box, dtype=float).reshape(-1, 2)
+            x0, y0 = np.floor(points.min(axis=0)).astype(int)
+            x1, y1 = np.ceil(points.max(axis=0)).astype(int)
+            words.append({"text": text, "confidence": float(confidence),
+                          "bbox": [int(x0), int(y0), int(x1), int(y1)]})
+        return "available", words
+    except ImportError:
+        return "unavailable", []
+    except Exception as exc:
+        return f"failed: {type(exc).__name__}: {exc}", []
+
+
 def _png_dimensions(data: bytes) -> Optional[Tuple[int, int]]:
     if data.startswith(b"\x89PNG\r\n\x1a\n") and len(data) >= 24:
         return struct.unpack(">II", data[16:24])
@@ -100,31 +127,16 @@ def _drawing_type(path: Path) -> str:
 
 def _ocr(path: Path) -> Tuple[str, List[Dict[str, Any]]]:
     """Read raster drawing text with RapidOCR, falling back to Tesseract."""
-    global _RAPID_OCR
     try:
-        import numpy as np
         from PIL import Image, ImageOps
-        from rapidocr_onnxruntime import RapidOCR
-
-        if _RAPID_OCR is None:
-            _RAPID_OCR = RapidOCR()
         with Image.open(path) as source:
-            image = np.asarray(ImageOps.exif_transpose(source).convert("RGB"))
-        result, _elapsed = _RAPID_OCR(image)
-        words = []
-        for detection in result or []:
-            box, text, confidence = detection
-            text = str(text).strip()
-            if not text:
-                continue
-            points = np.asarray(box, dtype=float).reshape(-1, 2)
-            x0, y0 = np.floor(points.min(axis=0)).astype(int)
-            x1, y1 = np.ceil(points.max(axis=0)).astype(int)
-            words.append({
-                "text": text, "confidence": float(confidence),
-                "bbox": [int(x0), int(y0), int(x1), int(y1)], "page": 1,
-            })
-        return "available", words
+            image = ImageOps.exif_transpose(source).convert("RGB")
+            status, detected = ocr_image_array(image)
+        if status == "unavailable":
+            raise ImportError("rapidocr_onnxruntime is not installed")
+        if status.startswith("failed:"):
+            raise RuntimeError(status)
+        return status, [{**word, "page": 1} for word in detected]
     except ImportError:
         # Keep a fallback for local environments that have Tesseract installed
         # but have not yet installed RapidOCR's ONNX runtime.

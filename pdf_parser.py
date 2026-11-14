@@ -10,8 +10,8 @@ from typing import Any, Dict, List, Optional
 def parse_pdf(file_path: str | Path) -> Dict[str, Any]:
     """Parse PDF text, words, tables, and page coordinates for evidence retrieval.
 
-    Raster-only PDFs remain indexed as pages with no extracted text; this
-    parser does not claim to OCR them or count drawn symbols.
+    Pages containing raster images and little embedded text receive shared
+    RapidOCR extraction. OCR boxes are mapped back to PDF page coordinates.
     """
     path = Path(file_path).resolve()
     if not path.is_file():
@@ -27,6 +27,26 @@ def parse_pdf(file_path: str | Path) -> Dict[str, Any]:
     with pdfplumber.open(path) as pdf:
         for page_number, page in enumerate(pdf.pages, start=1):
             words = page.extract_words(x_tolerance=2, y_tolerance=2, use_text_flow=True)
+            ocr_status = "not_needed" if len(words) >= 5 or not page.images else "skipped"
+            if len(words) < 5 and page.images:
+                try:
+                    from image_parser import ocr_image_array
+                    rendered = page.to_image(resolution=150).original.convert("RGB")
+                    ocr_status, ocr_words = ocr_image_array(rendered)
+                    if ocr_status == "available":
+                        scale_x = float(page.width) / rendered.width
+                        scale_y = float(page.height) / rendered.height
+                        words = [{
+                            "text": word["text"],
+                            "x0": word["bbox"][0] * scale_x,
+                            "top": word["bbox"][1] * scale_y,
+                            "x1": word["bbox"][2] * scale_x,
+                            "bottom": word["bbox"][3] * scale_y,
+                            "confidence": word["confidence"],
+                            "origin": "ocr",
+                        } for word in ocr_words]
+                except Exception as exc:
+                    ocr_status = f"failed: {type(exc).__name__}: {exc}"
             table_objects = page.find_tables()
             tables = []
             for table in table_objects:
@@ -45,13 +65,14 @@ def parse_pdf(file_path: str | Path) -> Dict[str, Any]:
                 "page": page_number,
                 "width": float(page.width),
                 "height": float(page.height),
-                "text": page.extract_text(x_tolerance=2, y_tolerance=2) or "",
+                "text": page.extract_text(x_tolerance=2, y_tolerance=2) or " ".join(w["text"] for w in words),
                 "words": [
-                    {key: word[key] for key in ("text", "x0", "top", "x1", "bottom")}
+                    {key: word[key] for key in ("text", "x0", "top", "x1", "bottom", "confidence", "origin") if key in word}
                     for word in words
                 ],
                 "tables": tables,
                 "image_count": len(page.images),
+                "ocr_status": ocr_status,
                 "vector_line_count": len(page.lines),
                 "vector_rect_count": len(page.rects),
                 "vector_curve_count": len(page.curves),
