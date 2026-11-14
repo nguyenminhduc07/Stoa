@@ -791,8 +791,7 @@ def answer_image_question(
     asks_general_rooms = (
         (query_plan is not None and query_plan.get("intent") == "count" and query_plan.get("target") in {"rooms", "spaces"})
         or (
-            query_plan is None
-            and category is None
+            category is None
             and asks_count
             and re.search(r"\b(?:rooms?|spaces?|huonetta|huoneita|raume|pieces|locali)\b", folded_q) is not None
         )
