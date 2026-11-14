@@ -3,6 +3,7 @@ ezdxf
 pdfplumber
 Pillow
 numpy
+rapidocr_onnxruntime
 scikit-image
 svgpathtools
 # optional, only for CLIP image routing in file_classifier.py:
