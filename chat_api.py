@@ -16,6 +16,7 @@ from typing import Dict, List, Literal, Optional
 from uuid import uuid4
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from conversation_pipeline import ConversationPipeline
@@ -46,6 +47,13 @@ class DrawingTypeRequest(BaseModel):
 app = FastAPI(title="Stoa Drawing QA", version="0.1.0")
 _sessions: Dict[str, SessionRecord] = {}
 _sessions_lock = threading.RLock()
+CHAT_PAGE = Path(__file__).parent / "static" / "index.html"
+
+
+@app.get("/", include_in_schema=False)
+def chat_page():
+    """Serve the browser chat; the API docs remain available at /docs."""
+    return FileResponse(CHAT_PAGE)
 
 
 def _session(session_id: str) -> SessionRecord:

@@ -1,0 +1,358 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f5f6f8">
+  <title>Stoa · Drawing assistant</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #202833;
+      --muted: #66717f;
+      --line: #e0e4e9;
+      --paper: #fff;
+      --canvas: #f5f6f8;
+      --accent: #245c4b;
+      --accent-hover: #194b3c;
+      --soft-green: #eaf3ee;
+      --soft-blue: #edf3f8;
+      --danger: #a23939;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--canvas); color: var(--ink); }
+    button, input { font: inherit; }
+    button { cursor: pointer; }
+    .app { min-height: 100vh; display: grid; grid-template-columns: 300px minmax(0, 1fr); }
+    aside { min-height: 100vh; padding: 24px 18px; background: #f0f2f4; border-right: 1px solid var(--line); display: flex; flex-direction: column; gap: 22px; }
+    .brand { display: flex; align-items: center; gap: 11px; padding: 0 5px; }
+    .brand-mark { width: 34px; height: 34px; display: grid; place-items: center; border-radius: 11px; color: white; background: var(--accent); font-weight: 750; letter-spacing: -.06em; }
+    .brand-name { font-size: 17px; font-weight: 720; letter-spacing: -.025em; }
+    .brand-caption { display: block; margin-top: 2px; color: var(--muted); font-size: 11px; font-weight: 500; letter-spacing: .02em; }
+    .new-chat { border: 0; border-radius: 9px; background: var(--accent); color: white; padding: 11px 13px; text-align: left; font-weight: 650; }
+    .new-chat:hover, .send:hover { background: var(--accent-hover); }
+    .section-label { margin: 0 5px 10px; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .1em; font-weight: 700; }
+    .file-list { display: grid; gap: 8px; }
+    .file-empty { padding: 14px; border: 1px dashed #cbd1d8; border-radius: 10px; color: var(--muted); font-size: 13px; line-height: 1.5; }
+    .file-card { width: 100%; padding: 11px; border: 1px solid var(--line); background: var(--paper); border-radius: 10px; text-align: left; color: var(--ink); }
+    .file-card:hover { border-color: #a9bbb2; }
+    .file-card.active { border-color: var(--accent); box-shadow: 0 0 0 2px #245c4b17; }
+    .file-name { overflow-wrap: anywhere; font-size: 13px; font-weight: 650; }
+    .file-meta { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 7px; color: var(--muted); font-size: 11px; }
+    .status { display: inline-flex; align-items: center; gap: 5px; }
+    .dot { width: 6px; height: 6px; border-radius: 50%; background: #a4abb3; }
+    .dot.parsed { background: #38845f; }
+    .dot.error { background: #c45151; }
+    .scope-control { margin-top: auto; padding: 12px; border-radius: 10px; background: #e7e9ec; color: var(--muted); font-size: 12px; line-height: 1.5; }
+    main { min-width: 0; display: flex; flex-direction: column; height: 100vh; }
+    .topbar { height: 64px; flex: 0 0 64px; display: flex; align-items: center; justify-content: space-between; padding: 0 28px; border-bottom: 1px solid var(--line); background: rgba(255,255,255,.72); }
+    .top-title { font-size: 14px; font-weight: 670; }
+    .top-subtitle { margin-left: 9px; color: var(--muted); font-size: 12px; font-weight: 450; }
+    .api-link { color: var(--muted); font-size: 12px; text-decoration: none; }
+    .api-link:hover { color: var(--accent); }
+    .conversation { width: min(900px, 100%); margin: 0 auto; padding: 30px 28px 20px; flex: 1; overflow-y: auto; }
+    .welcome { max-width: 650px; margin: 9vh auto 0; }
+    .eyebrow { color: var(--accent); font-size: 11px; letter-spacing: .12em; text-transform: uppercase; font-weight: 750; }
+    h1 { margin: 12px 0 10px; font-size: clamp(28px, 4vw, 40px); letter-spacing: -.045em; line-height: 1.12; font-weight: 680; }
+    .welcome-copy { max-width: 570px; color: var(--muted); font-size: 15px; line-height: 1.65; }
+    .suggestions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-top: 29px; }
+    .suggestion { padding: 14px; border: 1px solid var(--line); background: var(--paper); border-radius: 11px; text-align: left; color: var(--ink); font-size: 13px; line-height: 1.45; }
+    .suggestion:hover { border-color: #a9bbb2; background: #fcfdfc; }
+    .suggestion strong { display: block; margin-bottom: 5px; font-size: 12px; }
+    .messages { display: grid; gap: 23px; padding-bottom: 12px; }
+    .message { display: grid; grid-template-columns: 31px minmax(0, 1fr); gap: 12px; align-items: start; }
+    .avatar { width: 30px; height: 30px; display: grid; place-items: center; border-radius: 10px; background: var(--soft-green); color: var(--accent); font-size: 12px; font-weight: 750; }
+    .message.user .avatar { background: #e9edf2; color: #4f5a67; }
+    .message-content { min-width: 0; padding-top: 4px; }
+    .message-role { margin-bottom: 5px; color: var(--muted); font-size: 11px; font-weight: 650; }
+    .message-text { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 14px; line-height: 1.6; }
+    .answer-card { margin-top: 9px; padding: 13px 14px; border: 1px solid var(--line); border-radius: 10px; background: var(--paper); }
+    .answer-card.answered { border-left: 3px solid #438064; }
+    .answer-card.not_found, .answer-card.unsupported { border-left: 3px solid #b58b47; }
+    .answer-card.clarification_required { border-left: 3px solid #5681a4; }
+    .answer-heading { display: flex; align-items: baseline; flex-wrap: wrap; gap: 8px; margin-bottom: 7px; }
+    .answer-value { font-size: 16px; font-weight: 680; line-height: 1.45; }
+    .unit { color: var(--muted); font-size: 12px; }
+    .answer-reason { color: #45515d; font-size: 13px; line-height: 1.55; }
+    .answer-meta { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 9px; }
+    .chip { padding: 4px 8px; border-radius: 99px; background: #f0f2f4; color: #4f5a67; font-size: 10px; }
+    .evidence { margin-top: 11px; border-top: 1px solid #edf0f2; padding-top: 9px; }
+    .evidence summary { cursor: pointer; color: var(--accent); font-size: 12px; font-weight: 650; }
+    .evidence-list { display: grid; gap: 8px; margin-top: 8px; }
+    .evidence-item { padding: 9px 10px; border-radius: 7px; background: #f7f8f9; }
+    .evidence-title { margin-bottom: 5px; color: #56616d; font-size: 11px; font-weight: 700; }
+    .evidence-fields { display: flex; flex-wrap: wrap; gap: 5px 12px; }
+    .evidence-field { color: #59636e; font-size: 11px; overflow-wrap: anywhere; }
+    .evidence-field b { color: #343e48; font-weight: 650; }
+    .option-list { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 10px; }
+    .option { padding: 7px 10px; border: 1px solid #cdd8df; border-radius: 7px; background: white; color: #315f7a; font-size: 12px; }
+    .option:hover { background: var(--soft-blue); }
+    .thinking { display: inline-flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; }
+    .spinner { width: 13px; height: 13px; border: 2px solid #d7dfda; border-top-color: var(--accent); border-radius: 50%; animation: spin .7s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .composer-wrap { flex: 0 0 auto; padding: 10px 28px 20px; background: linear-gradient(transparent, var(--canvas) 18%); }
+    .composer { width: min(850px, 100%); margin: 0 auto; padding: 10px; border: 1px solid #d8dde2; border-radius: 14px; background: white; box-shadow: 0 5px 22px #1b25300b; }
+    .composer-row { display: flex; align-items: end; gap: 8px; }
+    .attach { width: 38px; height: 38px; flex: 0 0 38px; display: grid; place-items: center; border: 0; border-radius: 9px; background: #f0f2f4; color: #53606c; font-size: 20px; }
+    .attach:hover { background: #e8ebee; }
+    .question { width: 100%; min-height: 38px; max-height: 150px; resize: vertical; padding: 9px 7px; border: 0; outline: 0; color: var(--ink); font-size: 14px; line-height: 1.45; }
+    .question::placeholder { color: #929ba5; }
+    .send { height: 38px; padding: 0 15px; flex: 0 0 auto; border: 0; border-radius: 9px; background: var(--accent); color: white; font-size: 13px; font-weight: 650; }
+    .send:disabled, .attach:disabled, .question:disabled { opacity: .55; cursor: not-allowed; }
+    .composer-note { display: flex; justify-content: space-between; gap: 12px; margin: 7px 5px 0; color: var(--muted); font-size: 10px; }
+    .mobile-files { display: none; }
+    .toast { position: fixed; right: 20px; bottom: 20px; max-width: min(420px, calc(100vw - 40px)); padding: 12px 15px; border: 1px solid #e6caca; border-radius: 9px; background: #fff8f8; color: var(--danger); box-shadow: 0 7px 24px #1b25301a; font-size: 13px; z-index: 3; }
+    @media (max-width: 760px) {
+      .app { display: block; }
+      aside { display: none; }
+      main { height: 100dvh; }
+      .topbar { height: 56px; flex-basis: 56px; padding: 0 16px; }
+      .top-subtitle, .api-link { display: none; }
+      .mobile-files { display: block; }
+      .mobile-files summary { padding: 8px 11px; border: 1px solid var(--line); border-radius: 8px; background: white; color: #43505c; font-size: 12px; }
+      .mobile-files .file-list { position: absolute; left: 12px; right: 12px; z-index: 2; max-height: 45vh; overflow: auto; padding: 10px; border: 1px solid var(--line); border-radius: 10px; background: white; box-shadow: 0 8px 22px #1112; }
+      .conversation { padding: 20px 17px 12px; }
+      .welcome { margin-top: 8vh; }
+      .suggestions { grid-template-columns: 1fr; }
+      .composer-wrap { padding: 8px 12px 12px; }
+      .attach { width: 34px; height: 34px; flex-basis: 34px; }
+      .send { height: 34px; padding: 0 12px; }
+      .composer-note { font-size: 9px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <aside>
+      <div class="brand"><div class="brand-mark">S</div><div class="brand-name">Stoa<span class="brand-caption">DRAWING ASSISTANT</span></div></div>
+      <button class="new-chat" id="new-chat">＋ &nbsp; New conversation</button>
+      <section>
+        <h2 class="section-label">Drawings in this chat</h2>
+        <div class="file-list" id="file-list"><div class="file-empty">Upload a drawing or BIM model to get started.</div></div>
+      </section>
+      <div class="scope-control" id="scope-note">No drawing selected. Add files, then ask a question. Answers include evidence when the parser can identify it.</div>
+    </aside>
+    <main>
+      <header class="topbar">
+        <div><span class="top-title">Drawing assistant</span><span class="top-subtitle" id="chat-label">New conversation</span></div>
+        <details class="mobile-files"><summary id="mobile-files-summary">Drawings · 0</summary><div class="file-list" id="mobile-file-list"></div></details>
+        <a class="api-link" href="/docs" target="_blank" rel="noreferrer">API docs ↗</a>
+      </header>
+      <section class="conversation" id="conversation" aria-live="polite">
+        <div class="welcome" id="welcome">
+          <div class="eyebrow">Ask your drawings</div>
+          <h1>What do you need<br>to find?</h1>
+          <div class="welcome-copy">Upload plans, schedules, CAD files, or IFC models. Ask in everyday language and get an answer with the drawing evidence used to find it.</div>
+          <div class="suggestions">
+            <button class="suggestion" data-question="How many rooms are on this floor plan?"><strong>Count elements</strong>How many rooms are on this floor plan?</button>
+            <button class="suggestion" data-question="What is the total net floor area on this level?"><strong>Find an area</strong>What is the total net floor area on this level?</button>
+            <button class="suggestion" data-question="What is this room called?"><strong>Read a label</strong>What is this room called?</button>
+            <button class="suggestion" data-question="What information is available in this model?"><strong>Explore a model</strong>What information is available in this model?</button>
+          </div>
+        </div>
+        <div class="messages" id="messages"></div>
+      </section>
+      <footer class="composer-wrap">
+        <form class="composer" id="composer">
+          <input id="file-input" type="file" multiple hidden accept=".ifc,.dxf,.dwg,.pdf,.png,.jpg,.jpeg,.tif,.tiff,.bmp">
+          <div class="composer-row">
+            <button class="attach" type="button" id="attach" aria-label="Upload files" title="Upload drawings">＋</button>
+            <textarea class="question" id="question" rows="1" placeholder="Ask a question about your drawings…" maxlength="4000" aria-label="Question"></textarea>
+            <button class="send" type="submit" id="send">Send</button>
+          </div>
+          <div class="composer-note"><span id="upload-note">Attach multiple drawings or BIM files</span><span>Answers may need human verification</span></div>
+        </form>
+      </footer>
+    </main>
+  </div>
+  <div id="toast" class="toast" role="alert" hidden></div>
+  <script>
+    (() => {
+      const state = { conversationId: null, files: [], selectedFileId: null, busy: false, lastQuestion: "" };
+      const $ = (id) => document.getElementById(id);
+      const listNodes = [$('file-list'), $('mobile-file-list')];
+
+      function toast(message) {
+        const node = $('toast'); node.textContent = message; node.hidden = false;
+        clearTimeout(toast.timer); toast.timer = setTimeout(() => { node.hidden = true; }, 6000);
+      }
+      async function request(url, options = {}) {
+        const response = await fetch(url, options);
+        const contentType = response.headers.get('content-type') || '';
+        const payload = contentType.includes('application/json') ? await response.json() : null;
+        if (!response.ok) throw new Error(payload?.detail || `Request failed (${response.status})`);
+        return payload;
+      }
+      function make(tag, className, text) {
+        const node = document.createElement(tag); if (className) node.className = className;
+        if (text !== undefined && text !== null) node.textContent = String(text); return node;
+      }
+      function formatBytes(size) {
+        if (!Number.isFinite(Number(size))) return '';
+        const bytes = Number(size); return bytes >= 1024 * 1024 ? `${(bytes / 1024 / 1024).toFixed(1)} MB` : `${Math.max(1, Math.round(bytes / 1024))} KB`;
+      }
+      function updateScope() {
+        const selected = state.files.find(file => file.file_id === state.selectedFileId);
+        $('scope-note').textContent = selected
+          ? `Questions will use ${selected.name}. Click the file again to ask across all uploaded drawings.`
+          : state.files.length ? 'Questions will use the best matching uploaded file. Select a drawing to focus your question.'
+            : 'No drawing selected. Add files, then ask a question. Answers include evidence when the parser can identify it.';
+        $('mobile-files-summary').textContent = `Drawings · ${state.files.length}`;
+      }
+      function renderFiles() {
+        listNodes.forEach(node => {
+          node.replaceChildren();
+          if (!state.files.length) {
+            node.append(make('div', 'file-empty', 'Upload a drawing or BIM model to get started.')); return;
+          }
+          state.files.forEach(file => {
+            const card = make('button', `file-card${file.file_id === state.selectedFileId ? ' active' : ''}`);
+            card.type = 'button'; card.setAttribute('aria-pressed', String(file.file_id === state.selectedFileId));
+            card.append(make('div', 'file-name', file.name));
+            const meta = make('div', 'file-meta');
+            const status = make('span', 'status');
+            status.append(make('i', `dot ${file.parse_status === 'parsed' ? 'parsed' : file.parse_status === 'error' ? 'error' : ''}`));
+            status.append(document.createTextNode(file.parse_status === 'parsed' ? 'Ready' : file.parse_status === 'error' ? 'Parse issue' : 'Uploaded'));
+            meta.append(status, make('span', '', `${(file.format || 'file').toUpperCase()} · ${formatBytes(file.size_bytes)}`));
+            card.append(meta);
+            if (file.drawing_type) card.append(make('div', 'file-meta', `Image type · ${file.drawing_type.replaceAll('_', ' ')}`));
+            if (file.parse_error) card.title = file.parse_error;
+            card.addEventListener('click', () => {
+              state.selectedFileId = state.selectedFileId === file.file_id ? null : file.file_id;
+              renderFiles(); updateScope();
+              document.querySelector('.mobile-files').open = false;
+            });
+            node.append(card);
+          });
+        });
+        updateScope();
+      }
+      function scrollBottom() { $('conversation').scrollTop = $('conversation').scrollHeight; }
+      function addMessage(role, text) {
+        $('welcome').hidden = true;
+        const message = make('article', `message ${role}`);
+        message.append(make('div', 'avatar', role === 'user' ? 'You' : 'S'));
+        const content = make('div', 'message-content');
+        content.append(make('div', 'message-role', role === 'user' ? 'You' : 'Stoa'));
+        if (text) content.append(make('div', 'message-text', text));
+        message.append(content); $('messages').append(message); scrollBottom(); return content;
+      }
+      function displayValue(value) {
+        if (value === undefined || value === null || value === '') return null;
+        return typeof value === 'object' ? JSON.stringify(value, null, 2) : String(value);
+      }
+      function renderEvidence(parent, evidence) {
+        if (!Array.isArray(evidence) || !evidence.length) return;
+        const details = make('details', 'evidence');
+        details.append(make('summary', '', `Evidence used · ${evidence.length}`));
+        const list = make('div', 'evidence-list');
+        evidence.forEach((item, index) => {
+          const card = make('div', 'evidence-item');
+          const title = item.source || item.file || item.name || item.guid || item.GlobalId || `Evidence ${index + 1}`;
+          card.append(make('div', 'evidence-title', title));
+          const fields = make('div', 'evidence-fields');
+          Object.entries(item || {}).forEach(([key, value]) => {
+            if (['source', 'file', 'name'].includes(key) || value === null || value === undefined || value === '') return;
+            let shown = typeof value === 'object' ? JSON.stringify(value) : String(value);
+            if (shown.length > 320) shown = `${shown.slice(0, 317)}…`;
+            const field = make('span', 'evidence-field');
+            field.append(make('b', '', `${key.replaceAll('_', ' ')}: `), document.createTextNode(shown));
+            fields.append(field);
+          });
+          card.append(fields); list.append(card);
+        });
+        details.append(list); parent.append(details);
+      }
+      function renderAnswer(container, result) {
+        const status = result.status || 'answered';
+        const card = make('section', `answer-card ${status}`);
+        const heading = make('div', 'answer-heading');
+        const value = displayValue(result.value ?? result.answer);
+        if (value !== null) heading.append(make('div', 'answer-value', value));
+        if (result.unit) heading.append(make('span', 'unit', result.unit));
+        if (!value) heading.append(make('div', 'answer-value', status === 'unsupported' ? 'This question is not supported yet.' : status === 'clarification_required' ? 'Which drawing should I use?' : 'I could not verify an answer.'));
+        card.append(heading);
+        if (result.reason) card.append(make('div', 'answer-reason', result.reason));
+        const meta = make('div', 'answer-meta');
+        if (result.file) meta.append(make('span', 'chip', result.file));
+        if (result.format) meta.append(make('span', 'chip', String(result.format).toUpperCase()));
+        if (result.method) meta.append(make('span', 'chip', result.method));
+        if (result.review_recommended) meta.append(make('span', 'chip', 'Human review recommended'));
+        if (meta.childNodes.length) card.append(meta);
+        if (status === 'clarification_required' && Array.isArray(result.options)) {
+          const options = make('div', 'option-list');
+          result.options.forEach(option => {
+            const button = make('button', 'option', option.name || option.file_id); button.type = 'button';
+            button.addEventListener('click', () => sendQuestion(state.lastQuestion, option.file_id)); options.append(button);
+          });
+          card.append(options);
+        }
+        renderEvidence(card, result.evidence); container.append(card); scrollBottom();
+      }
+      async function createConversation(closePrevious = false) {
+        const previous = state.conversationId;
+        state.conversationId = null; state.files = []; state.selectedFileId = null;
+        $('messages').replaceChildren(); $('welcome').hidden = false; $('chat-label').textContent = 'New conversation';
+        renderFiles();
+        try {
+          if (closePrevious && previous) await request(`/conversations/${encodeURIComponent(previous)}`, { method: 'DELETE' });
+          const data = await request('/conversations', { method: 'POST' });
+          state.conversationId = data.conversation_id;
+          $('chat-label').textContent = `Chat · ${state.conversationId.slice(0, 8)}`;
+        } catch (error) { toast(`Could not start a conversation: ${error.message}`); }
+      }
+      async function refreshFiles() {
+        if (!state.conversationId) return;
+        const data = await request(`/conversations/${encodeURIComponent(state.conversationId)}/files`);
+        state.files = data.files || [];
+        if (!state.files.some(file => file.file_id === state.selectedFileId)) state.selectedFileId = null;
+        renderFiles();
+      }
+      async function uploadFiles(files) {
+        if (!files.length) return;
+        if (!state.conversationId) await createConversation();
+        if (!state.conversationId) return;
+        const form = new FormData(); files.forEach(file => form.append('files', file, file.name));
+        $('upload-note').textContent = `Uploading ${files.length} file${files.length === 1 ? '' : 's'}…`;
+        $('attach').disabled = true;
+        try {
+          const data = await request(`/conversations/${encodeURIComponent(state.conversationId)}/files`, { method: 'POST', body: form });
+          state.files.push(...(data.files || [])); renderFiles();
+          const names = (data.files || []).map(file => file.name).join(', ');
+          addMessage('assistant', `${data.files?.length || 0} file${data.files?.length === 1 ? '' : 's'} added: ${names}. Select a drawing in the sidebar or ask a question.`);
+        } catch (error) { toast(`Upload failed: ${error.message}`); }
+        finally { $('upload-note').textContent = 'Attach multiple drawings or BIM files'; $('attach').disabled = false; $('file-input').value = ''; }
+      }
+      async function sendQuestion(text, forcedFileId = undefined) {
+        const question = (text || '').trim(); if (!question || state.busy) return;
+        if (!state.conversationId) await createConversation();
+        if (!state.conversationId) return;
+        state.lastQuestion = question; addMessage('user', question);
+        const responseContent = addMessage('assistant', '');
+        const indicator = make('div', 'thinking'); indicator.append(make('i', 'spinner'), document.createTextNode('Checking the uploaded drawings…'));
+        responseContent.append(indicator); state.busy = true; $('send').disabled = true; $('question').disabled = true; $('attach').disabled = true;
+        const body = { question };
+        const fileId = forcedFileId !== undefined ? forcedFileId : state.selectedFileId;
+        if (fileId) body.file_id = fileId;
+        try {
+          const result = await request(`/conversations/${encodeURIComponent(state.conversationId)}/questions`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+          });
+          indicator.remove(); renderAnswer(responseContent, result);
+          await refreshFiles();
+        } catch (error) { indicator.remove(); responseContent.append(make('div', 'answer-reason', `I couldn't complete that request: ${error.message}`)); }
+        finally { state.busy = false; $('send').disabled = false; $('question').disabled = false; $('attach').disabled = false; $('question').focus(); }
+      }
+
+      $('new-chat').addEventListener('click', () => createConversation(true));
+      $('attach').addEventListener('click', () => $('file-input').click());
+      $('file-input').addEventListener('change', event => uploadFiles(Array.from(event.target.files || [])));
+      $('composer').addEventListener('submit', event => { event.preventDefault(); const value = $('question').value; $('question').value = ''; sendQuestion(value); });
+      $('question').addEventListener('keydown', event => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); $('composer').requestSubmit(); } });
+      document.querySelectorAll('.suggestion').forEach(button => button.addEventListener('click', () => { $('question').value = button.dataset.question; $('question').focus(); }));
+      createConversation();
+    })();
+  </script>
+</body>
+</html>
