@@ -594,14 +594,37 @@ def _cubicasa_prediction(image_path: str | Path, repo_path: str | Path, weights_
     return prediction
 
 
+def is_likely_floorplan_by_structure(
+    image_path: str | Path,
+    cubicasa_repo_path: str | Path | None = None,
+    cubicasa_weights_path: str | Path | None = None,
+) -> bool:
+    """Verify floor-plan layout via cached CubiCasa5K room + opening detections."""
+    if cubicasa_repo_path is None and cubicasa_weights_path is None:
+        cubicasa_repo_path, cubicasa_weights_path = default_cubicasa_paths()
+    if cubicasa_repo_path is None or cubicasa_weights_path is None:
+        return False
+    try:
+        pred = _cubicasa_prediction(image_path, cubicasa_repo_path, cubicasa_weights_path)
+    except Exception:
+        return False
+    strong_rooms = [r for r in pred.get("rooms", []) if float(r.get("confidence", 0.0)) >= 0.50]
+    strong_openings = [
+        ic for ic in pred.get("icons", [])
+        if ic.get("class") in {"Door", "Window"} and float(ic.get("confidence", 0.0)) >= 0.50
+    ]
+    return len(strong_rooms) >= 2 and len(strong_openings) >= 2
+
+
 def enrich_image_specialist_evidence(
     document: Dict[str, Any],
     *,
     cubicasa_repo_path: str | Path | None = None,
     cubicasa_weights_path: str | Path | None = None,
     geometry_model_path: str | Path | None = None,
+    include_rotated_ocr: bool = False,
 ) -> Dict[str, Any]:
-    """Attach cached floor-plan segmentation and 4-orientation room-label OCR to a parsed image."""
+    """Attach cached floor-plan segmentation and room-label OCR to a parsed image."""
     source = document.get("source", {}).get("path")
     drawing_type = document.get("drawing_type")
     if not source or drawing_type in _NON_FLOORPLAN_TYPES:
@@ -642,7 +665,20 @@ def enrich_image_specialist_evidence(
             width = int(document.get("width") or 0)
             height = int(document.get("height") or 0)
             if width > 0 and height > 0:
-                rot_labels = read_labels(source)
+                if include_rotated_ocr or not document.get("text"):
+                    rot_labels = read_labels(source)
+                else:
+                    rot_labels = {
+                        0: [
+                            {
+                                "text": str(w.get("text", "")),
+                                "conf": float(w.get("confidence", 0.0)),
+                                "bbox": list(w.get("bbox", [0, 0, 0, 0])),
+                            }
+                            for w in document.get("text", [])
+                            if w.get("text") and w.get("bbox")
+                        ]
+                    }
                 extracted: List[Dict[str, Any]] = []
                 for cat in ROOM_OCR_SUPPORTED:
                     if cat == "storeys":
@@ -849,6 +885,9 @@ def answer_image_question(
                 "reason": "This drawing type has OCR support, but no configured detector supports this question.",
                 "evidence": []}
 
+    if cubicasa_repo_path is None and cubicasa_weights_path is None and model_path is None and geometry_model_path is None:
+        cubicasa_repo_path, cubicasa_weights_path = default_cubicasa_paths()
+
     from train_floorplan_model import question_category
 
     category = question_category(question)
@@ -918,9 +957,15 @@ def answer_image_question(
              "class": item.get("class"), "confidence": item.get("confidence")}
             for item in regions
         ]
+        by_class: Dict[str, int] = {}
+        for item in regions:
+            cls_name = str(item.get("class") or "Room")
+            by_class[cls_name] = by_class.get(cls_name, 0) + 1
+        breakdown = ", ".join(f"{cnt} {cls}" for cls, cnt in by_class.items())
         return {
             "status": "answered", "value": len(regions), "answer": len(regions), "unit": "count",
-            "answer_text": f"{len(regions)} indoor room regions",
+            "answer_text": f"{len(regions)} indoor rooms ({breakdown})",
+            "reason": f"Summed all {len(regions)} detected indoor rooms across types: {breakdown}.",
             "method": method, "model": model_name, "review_recommended": True,
             "evidence": region_evidence,
         }

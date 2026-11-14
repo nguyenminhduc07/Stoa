@@ -12,6 +12,7 @@ class DocumentRouter:
     IMAGE_MODEL = "openai/clip-vit-base-patch32"
     IMAGE_LABELS = [
         "a technical architectural floor plan drawing from directly above, showing room layouts, walls, doors and windows",
+        "a colored residential or real-estate floor plan diagram from above showing rooms, walls, doors, windows and furniture",
         "a technical exterior elevation drawing showing the facade of a building",
         "a technical building section drawing cut vertically through a building",
         "a close-up construction detail drawing of a building component or assembly",
@@ -21,12 +22,13 @@ class DocumentRouter:
     ]
     LABEL_TO_TYPE = {
         IMAGE_LABELS[0]: "floor_plan",
-        IMAGE_LABELS[1]: "elevation",
-        IMAGE_LABELS[2]: "section",
-        IMAGE_LABELS[3]: "detail",
-        IMAGE_LABELS[4]: "site_plan",
-        IMAGE_LABELS[5]: "map",
-        IMAGE_LABELS[6]: "other",
+        IMAGE_LABELS[1]: "floor_plan",
+        IMAGE_LABELS[2]: "elevation",
+        IMAGE_LABELS[3]: "section",
+        IMAGE_LABELS[4]: "detail",
+        IMAGE_LABELS[5]: "site_plan",
+        IMAGE_LABELS[6]: "map",
+        IMAGE_LABELS[7]: "other",
     }
 
     def __init__(self, dataset_path: str):
@@ -131,13 +133,22 @@ class DocumentRouter:
         if not predictions:
             return "uncertain"
 
-        best = predictions[0]
-        # CLIP scores are relative to the candidate set. Avoid silently routing
-        # low-confidence or nearly tied results into a specialized parser.
-        second_score = predictions[1]["score"] if len(predictions) > 1 else 0.0
-        if best["score"] < 0.30 or best["score"] - second_score < 0.05:
-            return "uncertain"
-        return self.LABEL_TO_TYPE.get(best["label"], "uncertain")
+        scores_by_type: Dict[str, float] = {}
+        for item in predictions:
+            dtype = self.LABEL_TO_TYPE.get(item["label"], "uncertain")
+            scores_by_type[dtype] = scores_by_type.get(dtype, 0.0) + float(item["score"])
+        ranked = sorted(scores_by_type.items(), key=lambda kv: kv[1], reverse=True)
+        best_type, best_score = ranked[0]
+        second_score = ranked[1][1] if len(ranked) > 1 else 0.0
+        if best_score >= 0.24 and (best_score - second_score) >= 0.03:
+            return best_type
+        try:
+            from image_parser import is_likely_floorplan_by_structure
+            if is_likely_floorplan_by_structure(file_path):
+                return "floor_plan"
+        except Exception:
+            pass
+        return "uncertain"
 
 
 # --- Execution Example ---

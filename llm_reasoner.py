@@ -357,7 +357,10 @@ def build_image_evidence_pack(
         "ocr_label_summary_by_category": ocr_label_summary,
         "ocr_room_labels": ocr_labels_cat,
         "title_block_metadata": document.get("drawing_metadata") or {},
-        "ocr_text_lines": text_lines_cat,
+        "ocr_text_lines": (
+            [t for t in text_lines_cat if t.get("is_dimension")][:20]
+            + [t for t in text_lines_cat if not t.get("is_dimension")][:25]
+        ),
     }
     if document.get("floorplan_specialist_error"):
         catalog["floorplan_specialist_error"] = document["floorplan_specialist_error"]
@@ -619,8 +622,8 @@ def build_cad_evidence_pack(
         "windows": windows_cat,
         "sanitary_fixtures": fixtures_cat,
         "cad_layers": layers_cat,
-        "cad_dimensions": dims_cat,
-        "cad_texts": texts_cat,
+        "cad_dimensions": dims_cat[:40],
+        "cad_texts": texts_cat[:40],
     }
     return EvidencePack(
         file_id=file_id,
@@ -906,6 +909,15 @@ def build_ifc_evidence_pack(
     for c in cohorts_cat:
         category_totals[c["category"]] = category_totals.get(c["category"], 0) + int(c["count"])
 
+    spaces_by_storey: Dict[str, Dict[str, Any]] = {}
+    for sp in spaces_cat:
+        st_key = str(sp.get("storey") or "Unassigned")
+        st_bucket = spaces_by_storey.setdefault(st_key, {"count": 0, "total_area_m2": 0.0, "space_ids": []})
+        st_bucket["count"] += 1
+        if isinstance(sp.get("net_floor_area_m2"), (int, float)):
+            st_bucket["total_area_m2"] = round(st_bucket["total_area_m2"] + float(sp["net_floor_area_m2"]), 4)
+        st_bucket["space_ids"].append(sp["id"])
+
     catalog = {
         "file_id": file_id,
         "file_name": file_name,
@@ -921,8 +933,9 @@ def build_ifc_evidence_pack(
         ],
         "storeys": storeys_cat,
         "spaces_count": len(spaces_cat),
+        "spaces_by_storey_summary": spaces_by_storey,
         "element_totals_by_category": category_totals,
-        "spaces": spaces_cat,
+        "spaces": spaces_cat[:160],
         "element_cohorts": cohorts_cat,
     }
     return EvidencePack(
@@ -942,14 +955,20 @@ def build_pdf_evidence_pack(
     rendered_pages: Optional[Dict[int, Dict[str, Any]]] = None,
 ) -> EvidencePack:
     """Build a structured EvidencePack from PDF tables, text, dimensions, and rendered visual sheets."""
-    from pdf_parser import _door_type_description, _table_header, _table_rows
+    from pdf_parser import (
+        _door_type_description,
+        _expand_merged_schedule_rows,
+        _is_border_dump_table,
+        _table_header,
+        _table_rows,
+    )
 
     source = pdf_doc.get("source", {}).get("path") or file_name
     pages = pdf_doc.get("pages") or []
     rendered_pages = rendered_pages or {}
     nodes: Dict[str, EvidenceNode] = {}
 
-    all_tables = [table for p in pages for table in (p.get("tables") or [])]
+    all_tables = [table for p in pages for table in (p.get("tables") or []) if not _is_border_dump_table(table)]
     header_candidates = [t for t in all_tables if len(_table_rows(t)) <= 4]
 
     schedule_rows_cat: List[Dict[str, Any]] = []
@@ -958,19 +977,18 @@ def build_pdf_evidence_pack(
         p_num = int(page_obj.get("page") or 1)
         p_size = [float(page_obj.get("width") or 0), float(page_obj.get("height") or 0)]
         for t_idx, table in enumerate(page_obj.get("tables") or [], start=1):
+            if _is_border_dump_table(table):
+                continue
             raw_rows = _table_rows(table)
             if len(raw_rows) < 2:
                 continue
             headers = _table_header(table, header_candidates)
+            if not any(headers):
+                continue
             t_bbox = table.get("bbox")
-            for r_i, row_obj in enumerate(table.get("rows") or []):
-                cells_raw = row_obj.get("cells") or []
-                texts = [str(c.get("text") or "").replace("\n", " ").strip() for c in cells_raw]
-                if not any(texts):
-                    continue
-                joined_cf = " ".join(texts).casefold()
-                if r_i < 3 and any(h in joined_cf for h in ("door number", "room number", "floor finish", "fire rating", "frame material")):
-                    continue
+            raw_row_objs = table.get("rows") or []
+            for r_i, texts in _expand_merged_schedule_rows(raw_rows):
+                cells_raw = raw_row_objs[r_i].get("cells") or [] if r_i < len(raw_row_objs) else []
                 sr_idx += 1
                 nid = f"SR{sr_idx}"
                 mapped: Dict[str, str] = {}
@@ -1148,9 +1166,9 @@ def build_pdf_evidence_pack(
             "If visual_floorplan_pages is populated for the target page, reason over its P{page}_R*, P{page}_I*, and P{page}_L* items just like an image floor plan.",
         ],
         "schedule_rows_count": len(schedule_rows_cat),
-        "schedule_rows": schedule_rows_cat[:250],
+        "schedule_rows": schedule_rows_cat[:120],
         "door_legends": door_legends_cat,
-        "page_text_lines": page_texts_cat,
+        "page_text_lines": page_texts_cat[:60],
         "visual_floorplan_pages": visual_pages_cat,
     }
     return EvidencePack(
@@ -1285,7 +1303,7 @@ def _discover_gemini_models(api_key: str) -> List[str]:
     except Exception:
         return []
 
-    usable: List[Tuple[Tuple[int, int, str], str]] = []
+    usable: List[Tuple[Tuple[int, int, float, str], str]] = []
     for item in payload.get("models") or []:
         methods = item.get("supportedGenerationMethods") or []
         if "generateContent" not in methods:
@@ -1296,15 +1314,22 @@ def _discover_gemini_models(api_key: str) -> List[str]:
         if "gemini" not in low:
             continue
         if any(skip in low for skip in (
-            "embedding", "tts", "image", "audio", "robotics", "computer-use", "aqa", "thinking", "deep-research", "lite"
+            "embedding", "tts", "image", "audio", "robotics", "computer-use", "aqa", "thinking", "deep-research"
         )):
             continue
-        # Prefer flash models first, then pro, then newest name descending.
-        tier = 0 if "flash" in low and "lite" not in low else (1 if "flash" in low else (2 if "pro" in low else 3))
+        # Prefer fast flash / flash-lite models first, newest major.minor version first, stable before preview/exp.
+        tier = (
+            0 if "flash" in low and "lite" not in low else
+            1 if "flash" in low else
+            2 if "pro" in low else
+            3
+        )
         stable = 0 if "exp" not in low and "preview" not in low else 1
-        usable.append(((tier, stable, name), name))
+        m_ver = re.search(r"gemini-(\d+(?:\.\d+)?)", low)
+        ver = float(m_ver.group(1)) if m_ver else 0.0
+        usable.append(((tier, stable, -ver, name), name))
 
-    usable.sort(key=lambda pair: (pair[0][0], pair[0][1], pair[0][2]))
+    usable.sort(key=lambda pair: pair[0])
     discovered = [name for _, name in usable]
     if discovered:
         _DISCOVERED_GEMINI_MODELS = discovered
@@ -1322,19 +1347,25 @@ def _call_gemini_reasoner(api_key: str, payload_json: str) -> Dict[str, Any]:
         *([_WORKING_GEMINI_MODEL] if _WORKING_GEMINI_MODEL else []),
         configured or _DEFAULT_GEMINI_MODEL,
         "gemini-2.5-flash",
-        "gemini-2.0-flash",
         "gemini-2.5-flash-lite",
+        "gemini-2.0-flash",
     ]))
 
     def _build_body(model_name: str, *, disable_thinking: bool = True) -> bytes:
+        low_model = model_name.casefold()
         gen_cfg: Dict[str, Any] = {
             "temperature": 0,
-            "maxOutputTokens": 2048,
+            "maxOutputTokens": 8192,
             "responseMimeType": "application/json",
             "responseSchema": _REASONING_GEMINI_SCHEMA,
         }
-        if disable_thinking and ("2.5" in model_name or "3." in model_name or "3-" in model_name):
-            gen_cfg["thinkingConfig"] = {"thinkingBudget": 0}
+        if disable_thinking:
+            if "gemini-3" in low_model or "-3." in low_model or "-3-" in low_model:
+                gen_cfg["thinkingConfig"] = {"thinkingLevel": "MINIMAL"}
+            elif "2.5-pro" in low_model:
+                gen_cfg["thinkingConfig"] = {"thinkingBudget": 128}
+            elif "2.5" in low_model:
+                gen_cfg["thinkingConfig"] = {"thinkingBudget": 0}
         return json.dumps({
             "systemInstruction": {"parts": [{"text": _REASONING_SYSTEM_PROMPT}]},
             "contents": [{"role": "user", "parts": [{"text": payload_json}]}],
@@ -1361,7 +1392,7 @@ def _call_gemini_reasoner(api_key: str, payload_json: str) -> Dict[str, Any]:
                     method="POST",
                 )
                 try:
-                    with urllib.request.urlopen(req, timeout=60.0) as resp:
+                    with urllib.request.urlopen(req, timeout=25.0) as resp:
                         parsed = json.loads(resp.read().decode("utf-8"))
                     _WORKING_GEMINI_MODEL = model
                     return parsed
@@ -1375,7 +1406,7 @@ def _call_gemini_reasoner(api_key: str, payload_json: str) -> Dict[str, Any]:
                     if exc.code == 400 and disable_thinking and "thinking" in detail.casefold():
                         continue
                     last_error = f"HTTP {exc.code} for model '{model}': {detail}"
-                    if exc.code == 404:
+                    if exc.code in {404, 429, 503}:
                         break
                     raise RuntimeError(last_error) from exc
         return None
@@ -1393,7 +1424,11 @@ def _call_gemini_reasoner(api_key: str, payload_json: str) -> Dict[str, Any]:
     if not candidates:
         raise ValueError("Gemini returned no candidates for evidence reasoning.")
     parts = (candidates[0].get("content") or {}).get("parts") or []
-    text = "".join(str(part.get("text", "")) for part in parts).strip()
+    non_thought_parts = [part for part in parts if not part.get("thought")]
+    selected_parts = non_thought_parts if non_thought_parts else parts
+    text = "".join(str(part.get("text", "")) for part in selected_parts).strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.I | re.S).strip()
     if not text:
         raise ValueError("Gemini returned an empty reasoning response.")
     return json.loads(text)
