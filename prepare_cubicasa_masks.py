@@ -12,7 +12,7 @@ import os
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 
@@ -20,6 +20,15 @@ from floorplan_geometry_model import ICON_CLASSES, ROOM_CLASSES
 
 
 Job = Tuple[str, str, str, str]
+
+
+def _image_for_svg(svg_path: Path) -> Optional[Path]:
+    """Prefer CubiCasa's model-input resolution; use originals only as fallback."""
+    for name in ("F1_scaled.png", "F1_original.png"):
+        candidate = svg_path.parent / name
+        if candidate.is_file():
+            return candidate
+    return None
 
 
 def _is_valid_mask(path: Path) -> bool:
@@ -45,10 +54,8 @@ def _convert_one(job: Job) -> Tuple[str, str]:
         from floortrans.loaders.house import House
         from PIL import Image
 
-        image_path = svg_path.parent / "F1_original.png"
-        if not image_path.is_file():
-            image_path = svg_path.parent / "F1_scaled.png"
-        if not image_path.is_file():
+        image_path = _image_for_svg(svg_path)
+        if image_path is None:
             return "failed", f"no F1_original.png or F1_scaled.png beside {svg_path}"
 
         with Image.open(image_path) as image:
@@ -97,10 +104,8 @@ def prepare_masks(
     failures = []
     skipped_existing = 0
     for svg_path in sorted(dataset.rglob("model.svg")):
-        image_path = svg_path.parent / "F1_original.png"
-        if not image_path.is_file():
-            image_path = svg_path.parent / "F1_scaled.png"
-        if not image_path.is_file():
+        image_path = _image_for_svg(svg_path)
+        if image_path is None:
             failures.append(f"no F1_original.png or F1_scaled.png beside {svg_path}")
             continue
         target = (output / image_path.relative_to(dataset)).with_suffix(".npz")
