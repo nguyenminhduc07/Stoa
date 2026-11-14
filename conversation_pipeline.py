@@ -171,27 +171,59 @@ class ConversationPipeline:
     def _classify_image(self, path: Path, file_id: str) -> str:
         """Use zero-shot CLIP labels when Transformers/model weights exist."""
         try:
+            import torch
             from PIL import Image
-            from transformers import pipeline
             from file_classifier import DocumentRouter
 
-            if self._vision_classifier is None:
-                self._vision_classifier = pipeline(
-                    task="zero-shot-image-classification",
-                    model=DocumentRouter.IMAGE_MODEL,
-                    device=-1,
-                )
             with Image.open(path) as source:
                 image = source.convert("RGB")
-            predictions = self._vision_classifier(image, candidate_labels=DocumentRouter.IMAGE_LABELS)
+
+            if self._vision_classifier is None:
+                try:
+                    from transformers import pipeline
+                    self._vision_classifier = (
+                        "pipeline",
+                        pipeline(
+                            task="zero-shot-image-classification",
+                            model=DocumentRouter.IMAGE_MODEL,
+                            device=-1,
+                        ),
+                    )
+                except Exception:
+                    from transformers import CLIPModel, CLIPProcessor
+                    clip_model = CLIPModel.from_pretrained(DocumentRouter.IMAGE_MODEL)
+                    clip_proc = CLIPProcessor.from_pretrained(DocumentRouter.IMAGE_MODEL)
+                    clip_model.eval()
+                    self._vision_classifier = ("clip", (clip_model, clip_proc))
+
+            kind, clf = self._vision_classifier
+            if kind == "pipeline":
+                predictions = clf(image, candidate_labels=DocumentRouter.IMAGE_LABELS)
+            else:
+                clip_model, clip_proc = clf
+                inputs = clip_proc(
+                    text=DocumentRouter.IMAGE_LABELS,
+                    images=image,
+                    return_tensors="pt",
+                    padding=True,
+                )
+                with torch.no_grad():
+                    logits = clip_model(**inputs).logits_per_image[0]
+                    probs = logits.softmax(dim=-1).tolist()
+                predictions = sorted(
+                    [{"label": lbl, "score": float(sc)} for lbl, sc in zip(DocumentRouter.IMAGE_LABELS, probs)],
+                    key=lambda item: item["score"],
+                    reverse=True,
+                )
+
             if not predictions:
                 self.classification_warnings[file_id] = "Classifier returned no candidate labels."
                 return "uncertain"
             best = predictions[0]
             second = predictions[1]["score"] if len(predictions) > 1 else 0.0
             margin = float(best["score"]) - float(second)
-            min_margin = 0.015 if best["score"] >= 0.22 else 0.04
-            if best["score"] < 0.20 or margin < min_margin:
+            min_margin = 0.015 if best["score"] >= 0.17 else 0.03
+            if best["score"] < 0.17 or margin < min_margin:
                 self.classification_warnings[file_id] = (
                     f"Low classifier confidence: {best['label']}={best['score']:.3f}, "
                     f"runner-up={second:.3f}, margin={margin:.3f}."

@@ -226,6 +226,7 @@
             if (file.format === 'image') {
               const select = make('select', 'type-select');
               select.setAttribute('aria-label', `Drawing type for ${file.name}`);
+              if (file.classification_warning) select.title = file.classification_warning;
               ['floor_plan', 'elevation', 'section', 'detail', 'site_plan', 'map', 'other', 'uncertain'].forEach(opt => {
                 const option = make('option', '', `Type: ${opt.replaceAll('_', ' ')}`);
                 option.value = opt;
