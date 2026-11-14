@@ -1,7 +1,9 @@
-"""Conversation-scoped file ingestion, parser caching, and grounded question routing.
+"""Conversation-scoped file ingestion, specialist evidence caching, and LLM-reasoned QA.
 
-Create one ConversationPipeline per chat. It holds only in-memory metadata and
-parsed results; callers should discard it when that conversation ends.
+Create one ConversationPipeline per chat. Local parsers extract deterministic,
+provenance-preserving EvidencePacks once per uploaded file, and the LLM reasons
+over those inventories to select grounded evidence IDs and operations without
+hardcoded question templates or keyword lists.
 """
 
 from __future__ import annotations
@@ -10,27 +12,31 @@ import hashlib
 import math
 import re
 import threading
-import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+
+from llm_reasoner import (
+    EvidencePack,
+    build_cad_evidence_pack,
+    build_ifc_evidence_pack,
+    build_image_evidence_pack,
+    build_pdf_evidence_pack,
+    execute_reasoning_decision,
+    is_configured as llm_is_configured,
+    request_reasoning_decision,
+)
 
 
 _IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 _FORMAT_BY_EXTENSION = {
-    ".ifc": "ifc", ".dxf": "dxf", ".dwg": "dwg", ".pdf": "pdf",
+    ".ifc": "ifc",
+    ".dxf": "dxf",
+    ".dwg": "dwg",
+    ".pdf": "pdf",
     **{extension: "image" for extension in _IMAGE_EXTENSIONS},
 }
 _FORMAT_PRIORITY = {"ifc": 0, "dxf": 1, "dwg": 1, "pdf": 2, "image": 3}
-_AREA_TERMS = ("area", "surface", "superficie", "flache", "areal", "pinta-ala", "pindala")
-_LENGTH_TERMS = ("length", "laengde", "wie lang", "pikkus", "longueur", "pituus")
-_VOLUME_TERMS = ("volume", "volumen", "maht", "tilavuus")
-_COUNT_TERMS = ("how many", "number of", "count", "combien", "nombre de", "wie viele", "anzahl",
-                "quante", "quanti", "cuantos", "cuantas", "kuinka monta", "montako", "hvor mange", "mitu", "how much")
-_INTENT_BY_PLAN = {
-    "count": "count", "area": "area", "length": "length", "volume": "volume",
-    "lookup": "text", "describe": "text", "compare": "text", "other": "text",
-}
 
 
 @dataclass
@@ -46,6 +52,8 @@ class FileEntry:
     parsed: Optional[Dict[str, Any]] = field(default=None, repr=False)
     ifc_index: Any = field(default=None, repr=False)
     generic_cad: Optional[Dict[str, Any]] = field(default=None, repr=False)
+    rendered_pdf_pages: Dict[int, Dict[str, Any]] = field(default_factory=dict, repr=False)
+    evidence_pack: Optional[EvidencePack] = field(default=None, repr=False)
 
     def public(self, related_ids: Iterable[str] = ()) -> Dict[str, Any]:
         return {
@@ -63,12 +71,7 @@ class FileEntry:
 
 
 class ConversationPipeline:
-    """Manage files and grounded answers for one conversation.
-
-    Upload handlers should first save incoming files to a conversation-owned
-    directory, then pass those paths to ``add_files``. Parsing is lazy and each
-    document is parsed at most once until ``close`` is called.
-    """
+    """Manage uploaded files, cached EvidencePacks, and LLM-reasoned grounded answers."""
 
     def __init__(
         self,
@@ -79,6 +82,7 @@ class ConversationPipeline:
         cubicasa_weights: Optional[str | Path] = None,
         object_detector_model: Optional[str | Path] = None,
         render_dir: Optional[str | Path] = None,
+        reasoner_fn: Optional[Callable[..., Tuple[Dict[str, Any], str]]] = None,
     ) -> None:
         if cubicasa_repo is None and cubicasa_weights is None:
             try:
@@ -94,9 +98,10 @@ class ConversationPipeline:
         self.cubicasa_weights = Path(cubicasa_weights) if cubicasa_weights else default_weights
         self.object_detector_model = object_detector_model
         self.render_dir = Path(render_dir) if render_dir else None
+        self.reasoner_fn = reasoner_fn
         self.files: Dict[str, FileEntry] = {}
         self._groups: Dict[str, List[str]] = {}
-        self._active_group: Optional[str] = None
+        self.history: List[Dict[str, Any]] = []
         self._lock = threading.RLock()
         self._vision_classifier = None
         self.classification_warnings: Dict[str, str] = {}
@@ -113,7 +118,7 @@ class ConversationPipeline:
 
     @staticmethod
     def _detect_format(path: Path) -> str:
-        """Use extension and lightweight file signatures; never use dataset source names."""
+        """Identify file format from binary content signatures before falling back to suffix."""
         suffix = path.suffix.casefold()
         try:
             with path.open("rb") as stream:
@@ -128,17 +133,17 @@ class ConversationPipeline:
             return "dwg"
         if header.startswith(b"AutoCAD Binary DXF") or re.search(rb"(?:^|\r?\n)\s*0\r?\nSECTION\r?\n", header):
             return "dxf"
-        if (header.startswith(b"\x89PNG\r\n\x1a\n") or header.startswith(b"\xff\xd8")
-                or header.startswith(b"BM") or header.startswith((b"II*\x00", b"MM\x00*"))):
+        if (
+            header.startswith(b"\x89PNG\r\n\x1a\n")
+            or header.startswith(b"\xff\xd8")
+            or header.startswith(b"BM")
+            or header.startswith((b"II*\x00", b"MM\x00*"))
+        ):
             return "image"
         return _FORMAT_BY_EXTENSION.get(suffix, "unsupported")
 
     def add_files(self, paths: Iterable[str | Path]) -> List[Dict[str, Any]]:
-        """Register uploaded paths and return their manifest entries.
-
-        The caller owns upload copying and cleanup. Re-adding an unchanged path
-        returns the existing ID and preserves its parsed cache.
-        """
+        """Register uploaded paths and return their manifest entries."""
         added: List[str] = []
         for value in paths:
             path = Path(value).expanduser().resolve()
@@ -164,17 +169,16 @@ class ConversationPipeline:
         return [self._manifest_entry(file_id) for file_id in added]
 
     def _classify_image(self, path: Path, file_id: str) -> str:
-        """Use the shared zero-shot labels when Transformers/model weights exist."""
+        """Use zero-shot CLIP labels when Transformers/model weights exist."""
         try:
             from PIL import Image
             from transformers import pipeline
             from file_classifier import DocumentRouter
 
             if self._vision_classifier is None:
-                # CPU avoids sending CLIP through a possibly unsupported GPU
-                # wheel (the user's V100 needs a build that includes sm_70).
                 self._vision_classifier = pipeline(
-                    task="zero-shot-image-classification", model=DocumentRouter.IMAGE_MODEL,
+                    task="zero-shot-image-classification",
+                    model=DocumentRouter.IMAGE_MODEL,
                     device=-1,
                 )
             with Image.open(path) as source:
@@ -197,21 +201,24 @@ class ConversationPipeline:
             self.classification_warnings[file_id] = f"{type(exc).__name__}: {exc}"
             return "uncertain"
 
-    def _group_members_with_twins(self, group_id: str) -> List[str]:
-        members = list(self._groups.get(group_id, []))
+    def _canonical_group(self, group_id: str) -> str:
         if "_plan-" in group_id:
-            base_group = group_id.split("_plan-", 1)[0]
-            ifc_twins = [
-                fid for fid in self._groups.get(base_group, [])
-                if self.files[fid].format == "ifc" and fid not in members
-            ]
-            members = ifc_twins + members
+            base = group_id.split("_plan-", 1)[0]
+            if any(self.files[fid].format == "ifc" for fid in self._groups.get(base, [])):
+                return base
+        return group_id
+
+    def _group_members_with_twins(self, group_id: str) -> List[str]:
+        canon = self._canonical_group(group_id)
+        members = list(self._groups.get(canon, []))
         for other_group, other_ids in self._groups.items():
-            if other_group.startswith(f"{group_id}_plan-"):
-                if any(self.files[fid].format == "ifc" for fid in members):
-                    for fid in other_ids:
-                        if fid not in members:
-                            members.append(fid)
+            if other_group == group_id or (
+                other_group.startswith(f"{canon}_plan-")
+                and any(self.files[fid].format == "ifc" for fid in members)
+            ):
+                for fid in other_ids:
+                    if fid not in members:
+                        members.append(fid)
         return members
 
     def _manifest_entry(self, file_id: str) -> Dict[str, Any]:
@@ -227,263 +234,188 @@ class ConversationPipeline:
         """Return files currently registered in this conversation."""
         return [self._manifest_entry(file_id) for file_id in self.files]
 
-    @staticmethod
-    def _normalise(text: str) -> str:
-        value = unicodedata.normalize("NFKD", text).casefold()
-        return "".join(character for character in value if not unicodedata.combining(character))
-
-    def _intent(self, question: str) -> str:
-        text = self._normalise(question)
-        if any(term in text for term in _AREA_TERMS) or "m2" in text:
-            return "area"
-        if any(term in text for term in _VOLUME_TERMS) or "m3" in text:
-            return "volume"
-        if any(term in text for term in _LENGTH_TERMS):
-            return "length"
-        if any(term in text for term in _COUNT_TERMS):
-            return "count"
-        return "text"
-
-    def _canonical_group(self, group_id: str) -> str:
-        if "_plan-" in group_id:
-            base = group_id.split("_plan-", 1)[0]
-            if any(self.files[fid].format == "ifc" for fid in self._groups.get(base, [])):
-                return base
-        return group_id
-
-    def _select_group(self, question: str, file_id: Optional[str]) -> Tuple[Optional[List[str]], Optional[Dict[str, Any]]]:
-        if file_id is not None:
+    def set_drawing_type(self, file_id: str, drawing_type: str) -> Dict[str, Any]:
+        """Apply a user-confirmed image type and invalidate its cached EvidencePack."""
+        allowed = {"floor_plan", "elevation", "section", "detail", "site_plan", "map", "other", "uncertain"}
+        if drawing_type not in allowed:
+            raise ValueError(f"Unsupported drawing_type: {drawing_type}")
+        with self._lock:
             entry = self.files.get(file_id)
             if entry is None:
-                return None, {"status": "not_found", "reason": f"Unknown file_id: {file_id}", "evidence": []}
-            self._active_group = self._canonical_group(entry.group_id)
-            members = self._group_members_with_twins(entry.group_id)
-            return [file_id] + [fid for fid in members if fid != file_id], None
-        if not self.files:
-            return None, {"status": "not_found", "reason": "No files have been uploaded to this conversation.", "evidence": []}
+                raise KeyError(f"Unknown file_id: {file_id}")
+            if entry.format != "image":
+                raise ValueError("Only uploaded raster images have a drawing type")
+            entry.drawing_type = drawing_type
+            entry.parsed = None
+            entry.evidence_pack = None
+            entry.parse_status = "not_parsed"
+            entry.parse_error = None
+            return self._manifest_entry(file_id)
 
-        normalized = question.casefold()
-        mentioned_groups = set()
-        for entry in self.files.values():
-            stem = entry.path.stem.casefold()
-            if len(stem) >= 4 and (stem in normalized or entry.path.name.casefold() in normalized):
-                mentioned_groups.add(self._canonical_group(entry.group_id))
-        if len(mentioned_groups) == 1:
-            group = next(iter(mentioned_groups))
-            self._active_group = group
-            return self._group_members_with_twins(group), None
-
-        groups = list(dict.fromkeys(self._canonical_group(entry.group_id) for entry in self.files.values()))
-        if len(groups) == 1:
-            self._active_group = groups[0]
-            return self._group_members_with_twins(groups[0]), None
-        if mentioned_groups:
-            groups = [group for group in groups if group in mentioned_groups]
-            if len(groups) == 1:
-                self._active_group = groups[0]
-                return self._group_members_with_twins(groups[0]), None
-        follow_up = re.search(r"\b(?:it|its|this|that|there|same)\b", normalized)
-        if follow_up and self._active_group in self._groups:
-            return self._group_members_with_twins(self._active_group), None
-        options = []
-        for group in groups:
-            members = [self.files[item] for item in self._group_members_with_twins(group)]
-            representative = min(members, key=lambda item: _FORMAT_PRIORITY.get(item.format, 99))
-            options.append({"file_id": representative.file_id, "name": representative.path.name,
-                            "format": representative.format})
-        return None, {
-            "status": "clarification_required",
-            "answer": None,
-            "reason": "Several uploaded drawings could match; select the file to use.",
-            "options": options,
-            "evidence": [],
-        }
-
-    def _rank_files(self, group_ids: List[str], intent: str, forced_file_id: Optional[str] = None) -> List[FileEntry]:
-        candidates = [self.files[fid] for fid in group_ids if fid in self.files]
-        if forced_file_id and any(item.file_id == forced_file_id for item in candidates):
-            forced = next(item for item in candidates if item.file_id == forced_file_id)
-            rest = [item for item in candidates if item.file_id != forced_file_id]
-            rest.sort(key=lambda item: _FORMAT_PRIORITY.get(item.format, 99))
-            return [forced] + rest
-
-        def score(item: FileEntry) -> Tuple[int, int]:
-            fmt = item.format
-            if fmt == "ifc" and intent in {"area", "length", "volume", "count", "text"}:
-                rank = 0
-            elif fmt == "dxf" and intent in {"area", "count"}:
-                rank = 1
-            elif fmt == "dwg" and intent in {"area", "count"}:
-                rank = 2
-            elif fmt == "pdf":
-                rank = 3
-            elif fmt in {"dxf", "dwg"}:
-                rank = 4
-            elif fmt == "image":
-                rank = 5
-            elif fmt == "ifc":
-                rank = 6
-            else:
-                rank = 99
-            return (rank, _FORMAT_PRIORITY.get(fmt, 99))
-
-        return sorted(candidates, key=score)
-
-    def _select_file(self, group_ids: List[str], intent: str) -> FileEntry:
-        return self._rank_files(group_ids, intent)[0]
-
-    def _parse(self, entry: FileEntry) -> Dict[str, Any]:
+    def retry_parse(self, file_id: str) -> None:
+        """Clear a cached parse failure so the caller can retry after setup changes."""
         with self._lock:
-            if entry.parsed is not None:
-                return entry.parsed
+            entry = self.files.get(file_id)
+            if entry is None:
+                raise KeyError(f"Unknown file_id: {file_id}")
+            entry.parsed = None
+            entry.generic_cad = None
+            entry.rendered_pdf_pages.clear()
+            entry.evidence_pack = None
+            entry.parse_status = "not_parsed"
+            entry.parse_error = None
+
+    def _render_pdf_visual_page(self, entry: FileEntry, page_num: int) -> None:
+        """Render one PDF page at 150 DPI, run Image + Floor-Plan specialists, and update EvidencePack."""
+        with self._lock:
+            if page_num in entry.rendered_pdf_pages:
+                return
+            if entry.parsed is None:
+                from pdf_parser import parse_pdf
+                entry.parsed = parse_pdf(entry.path)
+            pages = entry.parsed.get("pages") or []
+            page_info = next((p for p in pages if int(p.get("page") or 1) == page_num), None)
+            if page_info is None:
+                return
+            from pdf_parser import _render_pdf_page_document
+            from image_parser import enrich_image_specialist_evidence
+
+            img_doc = _render_pdf_page_document(
+                entry.path, page_info, entry.parsed, render_dir=self.render_dir
+            )
+            enrich_image_specialist_evidence(
+                img_doc,
+                cubicasa_repo_path=self.cubicasa_repo,
+                cubicasa_weights_path=self.cubicasa_weights,
+                geometry_model_path=self.geometry_model,
+            )
+            p_w = float(page_info.get("width") or 1.0)
+            p_h = float(page_info.get("height") or 1.0)
+            i_w = max(1, int(img_doc.get("width") or 1))
+            i_h = max(1, int(img_doc.get("height") or 1))
+            entry.rendered_pdf_pages[page_num] = {
+                "document": img_doc,
+                "page_width": p_w,
+                "page_height": p_h,
+                "scale_x": p_w / i_w,
+                "scale_y": p_h / i_h,
+            }
+            entry.evidence_pack = build_pdf_evidence_pack(
+                entry.file_id,
+                entry.path.name,
+                entry.parsed,
+                rendered_pages=entry.rendered_pdf_pages,
+            )
+
+    def _ensure_evidence_pack(self, entry: FileEntry, *, has_exact_twin: bool = False) -> EvidencePack:
+        """Parse and cache the structured EvidencePack for one file."""
+        with self._lock:
+            if entry.evidence_pack is not None:
+                return entry.evidence_pack
             try:
                 if entry.format == "ifc":
                     from bim_parser import parse_ifc
-                    parsed = parse_ifc(entry.path)
+                    from ifc_qa import IfcIndex
+                    if entry.parsed is None:
+                        entry.parsed = parse_ifc(entry.path)
+                    if entry.ifc_index is None:
+                        entry.ifc_index = IfcIndex(str(entry.path))
+                    pack = build_ifc_evidence_pack(
+                        entry.file_id, entry.path.name, entry.parsed, entry.ifc_index
+                    )
                 elif entry.format in {"dxf", "dwg"}:
                     from cad_qa import build_floor_index
-                    parsed = build_floor_index(entry.path)
+                    from cad_parser import parse_cad
+                    if entry.parsed is None:
+                        entry.parsed = build_floor_index(entry.path)
+                    if entry.generic_cad is None:
+                        try:
+                            entry.generic_cad = parse_cad(entry.path)
+                        except Exception:
+                            entry.generic_cad = None
+                    pack = build_cad_evidence_pack(
+                        entry.file_id, entry.path.name, entry.format, entry.parsed, entry.generic_cad
+                    )
                 elif entry.format == "pdf":
                     from pdf_parser import parse_pdf
-                    parsed = parse_pdf(entry.path)
+                    if entry.parsed is None:
+                        entry.parsed = parse_pdf(entry.path)
+                    pages = entry.parsed.get("pages") or []
+                    # Pre-render single-sheet standalone drawing PDFs with no schedule tables
+                    # so spatial floor-plan evidence is available on the very first turn.
+                    if not has_exact_twin and len(pages) == 1 and not (pages[0].get("tables") or []):
+                        p0 = pages[0]
+                        vec_cnt = (
+                            int(p0.get("vector_line_count") or 0)
+                            + int(p0.get("vector_rect_count") or 0)
+                            + int(p0.get("image_count") or 0)
+                        )
+                        if vec_cnt > 0:
+                            self._render_pdf_visual_page(entry, 1)
+                    pack = entry.evidence_pack or build_pdf_evidence_pack(
+                        entry.file_id,
+                        entry.path.name,
+                        entry.parsed,
+                        rendered_pages=entry.rendered_pdf_pages,
+                    )
                 elif entry.format == "image":
-                    from image_parser import parse_image
-                    parsed = parse_image(entry.path, run_ocr=True)
-                    parsed["drawing_type"] = entry.drawing_type or "uncertain"
+                    from image_parser import enrich_image_specialist_evidence, parse_image
+                    if entry.parsed is None:
+                        entry.parsed = parse_image(entry.path, run_ocr=True)
+                    entry.parsed["drawing_type"] = entry.drawing_type or "uncertain"
+                    enrich_image_specialist_evidence(
+                        entry.parsed,
+                        cubicasa_repo_path=self.cubicasa_repo,
+                        cubicasa_weights_path=self.cubicasa_weights,
+                        geometry_model_path=self.geometry_model,
+                    )
+                    pack = build_image_evidence_pack(entry.file_id, entry.path.name, entry.parsed)
                 else:
                     raise ValueError(f"Unsupported upload format: {entry.path.suffix or '(none)'}")
-                entry.parsed = parsed
+
+                entry.evidence_pack = pack
                 entry.parse_status = "parsed"
-                return parsed
+                entry.parse_error = None
+                return pack
             except Exception as exc:
                 entry.parse_status = "error"
                 entry.parse_error = f"{type(exc).__name__}: {exc}"
                 raise
 
-    def _parse_generic_cad(self, entry: FileEntry) -> Dict[str, Any]:
-        with self._lock:
-            if entry.generic_cad is None:
-                from cad_parser import parse_cad
-                entry.generic_cad = parse_cad(entry.path)
-            return entry.generic_cad
-
-    @staticmethod
-    def _answer_generic_cad_question(question: str, cad_doc: Dict[str, Any]) -> Dict[str, Any]:
-        q_norm = ConversationPipeline._normalise(question)
-        source_path = cad_doc.get("source", {}).get("path")
-        entities = cad_doc.get("entities", [])
-
-        if any(term in q_norm for term in ("layer", "layers", "what layers")):
-            layers = [layer for layer in cad_doc.get("layers", []) if layer.get("entity_count", 0) > 0]
-            if layers:
-                summary = ", ".join(f"{item['name']} ({item['entity_count']})" for item in layers[:25])
-                return {
-                    "status": "answered",
-                    "answer": f"{len(layers)} populated CAD layers: {summary}",
-                    "method": "cad_layer_inventory",
-                    "evidence": [{"source": source_path, "layers": [item["name"] for item in layers[:25]]}],
-                }
-
-        quoted = re.search(r"[\"'](.+?)[\"']|[\u2018\u201c](.+?)[\u2019\u201d]", question)
-        if quoted:
-            target = ConversationPipeline._normalise(quoted.group(1) or quoted.group(2)).strip()
-            matches = [
-                ent for ent in entities
-                if ent.get("text") and target and target in ConversationPipeline._normalise(ent["text"])
+    def _candidate_entries(self, forced_file_id: Optional[str]) -> List[FileEntry]:
+        """Select candidate files per drawing group, prioritizing exact formats for twins."""
+        if forced_file_id is not None:
+            forced = self.files.get(forced_file_id)
+            if forced is None:
+                return []
+            twins = [
+                self.files[fid]
+                for fid in self._group_members_with_twins(forced.group_id)
+                if fid in self.files and fid != forced_file_id
             ]
-            if matches:
-                first = matches[0]
-                return {
-                    "status": "answered",
-                    "answer": str(first["text"]),
-                    "method": "cad_text_entity_lookup",
-                    "evidence": [
-                        {
-                            "source": source_path,
-                            "handle": ent.get("handle"),
-                            "layer": ent.get("layer"),
-                            "bbox": ent.get("bbox"),
-                            "text": ent.get("text"),
-                        }
-                        for ent in matches[:10]
-                    ],
-                }
+            twins.sort(key=lambda item: _FORMAT_PRIORITY.get(item.format, 99))
+            return [forced] + twins[:1]
 
-        if any(term in q_norm for term in ("dimension", "dimensions", "measurement", "measurements")):
-            dims = [
-                ent for ent in entities
-                if ent.get("type") == "DIMENSION" and (
-                    ent.get("geometry", {}).get("measurement") is not None or ent.get("text")
-                )
-            ]
-            if dims:
-                unit_name = cad_doc.get("units", {}).get("name") or "drawing units"
-                items_txt = [
-                    str(ent.get("text") or f"{round(float(ent['geometry']['measurement']), 3)} {unit_name}")
-                    for ent in dims[:10]
-                ]
-                return {
-                    "status": "answered",
-                    "answer": ", ".join(items_txt),
-                    "method": "cad_dimension_entities",
-                    "evidence": [
-                        {
-                            "source": source_path,
-                            "handle": ent.get("handle"),
-                            "layer": ent.get("layer"),
-                            "bbox": ent.get("bbox"),
-                            "measurement": ent.get("geometry", {}).get("measurement"),
-                        }
-                        for ent in dims[:10]
-                    ],
-                }
-
-        return {
-            "status": "unsupported",
-            "answer": None,
-            "reason": "The CAD answerer could not match this question to semantic floor-plan layers or CAD text/dimension entities.",
-            "evidence": [],
-        }
+        canonical_groups = list(
+            dict.fromkeys(self._canonical_group(e.group_id) for e in self.files.values())
+        )
+        selected: List[FileEntry] = []
+        for group in canonical_groups:
+            members = [self.files[fid] for fid in self._group_members_with_twins(group) if fid in self.files]
+            members.sort(key=lambda item: _FORMAT_PRIORITY.get(item.format, 99))
+            if not members:
+                continue
+            primary = members[0]
+            selected.append(primary)
+            # If the primary twin is IFC/DXF and there is also a PDF schedule twin, include the PDF too.
+            if primary.format in {"ifc", "dxf", "dwg"}:
+                pdf_twin = next((m for m in members[1:] if m.format == "pdf" and "_plan-" not in m.group_id), None)
+                if pdf_twin is not None:
+                    selected.append(pdf_twin)
+        return selected[:8]
 
     @staticmethod
-    def _filters_supported_for_format(fmt: str, intent: str, plan: Any) -> bool:
-        if plan is None or not getattr(plan, "filters", ()):
-            return True
-        universal_cues = (
-            "indoor", "interior room", "numbered", "outdoor", "balcon", "loggia",
-            "terrac", "shaft", "void", "separate", "storey", "floor", "level",
-            "korrus", "sal", "geschoss", "etage", "plan", "drawing", "whole", "entire",
-        )
-        ifc_cues = (
-            "exterior", "external", "interior", "internal", "partition",
-            "load-bearing", "load bearing", "loadbearing", "concrete", "foundation",
-            "structural", "fire", "glazing", "thermal", "u-value", "u value",
-            "office", "buero", "tile", "tiling", "vapor", "vapour", "skirting",
-            "type", "material", "room", "space", "door", "window", "pipe", "duct",
-        )
-        cad_cues = ("apartment", "wohnung", "appartement", "unit", "whg", "room", "label", "named", "number")
-        pdf_cues = (
-            "schedule", "type", "mark", "material", "frame", "finish", "fire",
-            "hardware", "north", "south", "east", "west", "room", "door", "window", "note", "page",
-        )
-        target = str(getattr(plan, "target", "") or "")
-        for raw_filter in plan.filters:
-            norm_f = ConversationPipeline._normalise(str(raw_filter))
-            if any(cue in norm_f for cue in universal_cues):
-                continue
-            if fmt == "ifc" and any(cue in norm_f for cue in ifc_cues):
-                continue
-            if fmt in {"dxf", "dwg"} and (intent == "area" or target in {"rooms", "spaces", "other"}) and any(
-                cue in norm_f for cue in cad_cues
-            ):
-                continue
-            if fmt == "pdf" and any(cue in norm_f for cue in pdf_cues):
-                continue
-            return False
-        return True
-
-    @staticmethod
-    def _validate_answer(result: Dict[str, Any], intent: str) -> Dict[str, Any]:
+    def _validate_answer(result: Dict[str, Any]) -> Dict[str, Any]:
         """Validate numeric sanity and provenance citations before returning an answer."""
         validated = dict(result)
         status = validated.get("status")
@@ -501,6 +433,7 @@ class ConversationPipeline:
                 "validated": False,
             }
 
+        unit = validated.get("unit")
         if isinstance(primary, (int, float)) and not isinstance(primary, bool):
             if not math.isfinite(float(primary)):
                 return {
@@ -510,7 +443,7 @@ class ConversationPipeline:
                     "evidence": [],
                     "validated": False,
                 }
-            if intent in {"count", "area", "length", "volume"} and float(primary) < 0:
+            if unit in {"count", "m2", "m", "m3"} and float(primary) < 0:
                 return {
                     "status": "not_found",
                     "answer": None,
@@ -518,8 +451,9 @@ class ConversationPipeline:
                     "evidence": [],
                     "validated": False,
                 }
-            if intent == "count":
+            if unit == "count":
                 validated["value"] = int(round(float(primary)))
+                validated["answer"] = validated["value"]
 
         evidence = validated.get("evidence")
         if not isinstance(evidence, list) or not evidence:
@@ -530,217 +464,178 @@ class ConversationPipeline:
             validated["validated"] = True
         return validated
 
-    def set_drawing_type(self, file_id: str, drawing_type: str) -> Dict[str, Any]:
-        """Apply a user-confirmed image type and invalidate its parsed cache."""
-        allowed = {"floor_plan", "elevation", "section", "detail", "site_plan", "map", "other", "uncertain"}
-        if drawing_type not in allowed:
-            raise ValueError(f"Unsupported drawing_type: {drawing_type}")
-        with self._lock:
-            entry = self.files.get(file_id)
-            if entry is None:
-                raise KeyError(f"Unknown file_id: {file_id}")
-            if entry.format != "image":
-                raise ValueError("Only uploaded raster images have a drawing type")
-            entry.drawing_type = drawing_type
-            entry.parsed = None
-            entry.parse_status = "not_parsed"
-            entry.parse_error = None
-            return self._manifest_entry(file_id)
+    def answer(self, question: str, *, file_id: Optional[str] = None) -> Dict[str, Any]:
+        """Answer any natural-language question via grounded LLM reasoning over cached EvidencePacks."""
+        if not self.files:
+            return {
+                "status": "not_found",
+                "answer": None,
+                "reason": "No files have been uploaded to this conversation.",
+                "evidence": [],
+            }
+        if file_id is not None and file_id not in self.files:
+            return {
+                "status": "not_found",
+                "answer": None,
+                "reason": f"Unknown file_id: {file_id}",
+                "evidence": [],
+            }
 
-    def retry_parse(self, file_id: str) -> None:
-        """Clear a cached parse failure so the caller can retry after setup changes."""
-        with self._lock:
-            entry = self.files.get(file_id)
-            if entry is None:
-                raise KeyError(f"Unknown file_id: {file_id}")
-            entry.parsed = None
-            entry.generic_cad = None
-            entry.parse_status = "not_parsed"
-            entry.parse_error = None
-
-    def _answer_with_entry(
-        self,
-        entry: FileEntry,
-        parser_question: str,
-        intent: str,
-        plan: Any,
-    ) -> Dict[str, Any]:
-        if not self._filters_supported_for_format(entry.format, intent, plan):
+        reasoner = self.reasoner_fn or request_reasoning_decision
+        if self.reasoner_fn is None and not llm_is_configured():
             return {
                 "status": "unsupported",
                 "answer": None,
                 "reason": (
-                    "The question includes a condition the current drawing query executors do not "
-                    "apply yet, so I am not returning an unfiltered result."
+                    "Natural-language reasoning requires an LLM API key. "
+                    "Set GEMINI_API_KEY in .env (or export GEMINI_API_KEY in your shell) and ask again."
                 ),
+                "evidence": [],
+                "query_interpretation": {
+                    "planner": "llm_grounded_reasoner",
+                    "status": "not_configured",
+                },
+            }
+
+        candidates = self._candidate_entries(file_id)
+        packs: List[EvidencePack] = []
+        last_parse_error: Optional[Tuple[FileEntry, Exception]] = None
+        for entry in candidates:
+            siblings = self._group_members_with_twins(entry.group_id)
+            has_exact_twin = any(
+                self.files[fid].format in {"ifc", "dxf", "dwg"} and fid != entry.file_id
+                for fid in siblings
+                if fid in self.files
+            )
+            try:
+                packs.append(self._ensure_evidence_pack(entry, has_exact_twin=has_exact_twin))
+            except Exception as exc:
+                last_parse_error = (entry, exc)
+
+        if not packs:
+            if last_parse_error is not None:
+                failed_entry, exc = last_parse_error
+                return {
+                    "status": "not_found",
+                    "answer": None,
+                    "reason": f"Could not parse {failed_entry.path.name}: {type(exc).__name__}: {exc}",
+                    "evidence": [],
+                    "file_id": failed_entry.file_id,
+                }
+            return {
+                "status": "not_found",
+                "answer": None,
+                "reason": "No readable drawing files are available in this conversation.",
                 "evidence": [],
             }
 
-        document = self._parse(entry)
-        if entry.format == "ifc":
-            from ifc_qa import IfcIndex, answer_ifc_question, answer_ifc_text_question
-            if entry.ifc_index is None:
-                entry.ifc_index = IfcIndex(str(entry.path))
-            has_ifc_filter = bool(plan and getattr(plan, "filters", ())) and any(
-                cue in self._normalise(" ".join(plan.filters))
-                for cue in ("exterior", "external", "interior", "internal", "partition", "load", "concrete", "type", "material")
-            )
-            if intent == "area" and not has_ifc_filter:
-                result = answer_ifc_question(parser_question, entry.ifc_index)
-                if result.get("status") == "unsupported":
-                    from bim_qa import answer_area_question
-                    result = answer_area_question(parser_question, document)
-                if result.get("status") in {"unsupported", "not_found"}:
-                    text_res = answer_ifc_text_question(parser_question, entry.ifc_index)
-                    if text_res.get("status") == "answered":
-                        result = text_res
-                return result
-
-            text_first = intent == "text" or has_ifc_filter or (
-                intent == "count" and any(term in parser_question.casefold() for term in ("type", "types", "breakdown", "distribution"))
-            )
-            if text_first:
-                result = answer_ifc_text_question(parser_question, entry.ifc_index)
-                if result.get("status") == "unsupported" and not has_ifc_filter:
-                    result = answer_ifc_question(parser_question, entry.ifc_index)
-            else:
-                result = answer_ifc_question(parser_question, entry.ifc_index)
-                if result.get("status") == "unsupported":
-                    result = answer_ifc_text_question(parser_question, entry.ifc_index)
-            return result
-
-        if entry.format in {"dxf", "dwg"}:
-            has_semantic_layers = any(
-                bool(document.get(key)) for key in ("rooms", "units", "doors", "windows", "fixtures")
-            )
-            if intent in {"area", "count"} and has_semantic_layers:
-                from cad_qa import answer_cad_question
-                cad_res = answer_cad_question(parser_question, document)
-                if cad_res.get("status") == "answered":
-                    return cad_res
-                if intent in {"area", "count"}:
-                    return cad_res
-            cad_doc = self._parse_generic_cad(entry)
-            return self._answer_generic_cad_question(parser_question, cad_doc)
-
-        if entry.format == "pdf":
-            from pdf_parser import answer_pdf_question
-            return answer_pdf_question(
-                parser_question,
-                document,
-                enable_visual_fallback=True,
-                render_dir=self.render_dir,
-                model_path=self.count_model,
-                geometry_model_path=self.geometry_model,
-                cubicasa_repo_path=self.cubicasa_repo,
-                cubicasa_weights_path=self.cubicasa_weights,
-                object_detector_model=self.object_detector_model,
-                query_plan=plan.public() if plan else None,
-            )
-
-        if entry.format == "image":
-            from image_parser import answer_image_question
-            return answer_image_question(
-                parser_question,
-                document,
-                model_path=self.count_model,
-                geometry_model_path=self.geometry_model,
-                cubicasa_repo_path=self.cubicasa_repo,
-                cubicasa_weights_path=self.cubicasa_weights,
-                object_detector_model=self.object_detector_model,
-                query_plan=plan.public() if plan else None,
-            )
-
-        return {
-            "status": "unsupported",
-            "answer": None,
-            "evidence": [],
-            "reason": "No question answerer is available for this file format.",
+        twin_map = {
+            entry.file_id: [
+                self.files[fid].path.name
+                for fid in self._group_members_with_twins(entry.group_id)
+                if fid in self.files and fid != entry.file_id
+            ]
+            for entry in candidates
+            if entry.file_id in {p.file_id for p in packs}
         }
 
-    def answer(self, question: str, *, file_id: Optional[str] = None) -> Dict[str, Any]:
-        """Answer a question from this chat's files, with grounded evidence."""
-        groups, error = self._select_group(question, file_id)
-        if error is not None:
-            return error
-        assert groups is not None
-        plan = None
-        planner_error = None
         try:
-            from llm_query_planner import plan_question
-            group_formats = [self.files[item].format for item in groups]
-            plan = plan_question(question, group_formats)
+            decision, provider = reasoner(
+                question,
+                packs,
+                history=self.history,
+                forced_file_id=file_id,
+                twin_relationships=twin_map,
+            )
+
+            # On-demand visual page render loop for PDFs when visual analysis is requested by the LLM
+            if str(decision.get("action")) == "render_pdf_page":
+                target_fid = str(decision.get("file_id") or packs[0].file_id)
+                target_entry = self.files.get(target_fid)
+                target_page = int(decision.get("pdf_page_to_render") or 1)
+                if target_entry is not None and target_entry.format == "pdf":
+                    self._render_pdf_visual_page(target_entry, target_page)
+                    if target_entry.evidence_pack is not None:
+                        packs = [
+                            target_entry.evidence_pack if p.file_id == target_fid else p
+                            for p in packs
+                        ]
+                        decision, provider = reasoner(
+                            question,
+                            packs,
+                            history=self.history,
+                            forced_file_id=file_id,
+                            twin_relationships=twin_map,
+                        )
         except Exception as exc:
-            # The LLM improves interpretation but must never prevent the
-            # existing deterministic route from answering a question.
-            planner_error = type(exc).__name__
-        intent = _INTENT_BY_PLAN.get(plan.intent, "text") if plan else self._intent(question)
-        parser_question = plan.canonical_question if plan else question
-        interpretation = {
-            "planner": "openai_function_call" if plan else "keyword_fallback",
-            "status": "planned" if plan else ("fallback" if planner_error else "not_configured"),
-            "intent": plan.intent if plan else intent,
-            "target": plan.target if plan else None,
-            "scope": plan.scope if plan else None,
-            "fallback_reason": planner_error,
+            return {
+                "status": "not_found",
+                "answer": None,
+                "reason": f"LLM reasoning request failed ({type(exc).__name__}: {exc}). Check GEMINI_API_KEY and network connectivity.",
+                "evidence": [],
+                "query_interpretation": {
+                    "planner": "llm_grounded_reasoner",
+                    "status": "error",
+                    "fallback_reason": f"{type(exc).__name__}: {exc}",
+                },
+            }
+
+        packs_by_id = {p.file_id: p for p in packs}
+        clarification_options = (
+            [
+                {"file_id": p.file_id, "name": p.file_name, "format": p.format}
+                for p in packs
+            ]
+            if len(packs) > 1
+            else None
+        )
+        chosen_pack, raw_result = execute_reasoning_decision(
+            decision,
+            packs_by_id,
+            provider=provider,
+            fallback_options=clarification_options,
+        )
+        validated = self._validate_answer(raw_result)
+
+        chosen_entry = self.files.get(chosen_pack.file_id) if chosen_pack else self.files.get(packs[0].file_id)
+        if chosen_entry is not None:
+            validated["file_id"] = chosen_entry.file_id
+            validated["file"] = chosen_entry.path.name
+            validated["format"] = chosen_entry.format
+            validated["drawing_type"] = chosen_entry.drawing_type
+            siblings = self._group_members_with_twins(chosen_entry.group_id)
+            validated["related_files"] = [
+                self.files[fid].path.name
+                for fid in siblings
+                if fid in self.files and fid != chosen_entry.file_id
+            ]
+
+        validated["query_interpretation"] = {
+            "planner": f"llm_grounded_reasoner ({provider})",
+            "status": "reasoned",
+            "operation": decision.get("operation"),
+            "selected_count": len(decision.get("selected_ids") or []),
         }
-        if plan and plan.clarification_question:
-            return {
-                "status": "clarification_required", "answer": plan.clarification_question,
-                "reason": "The question needs one more detail before it can be checked against the drawing.",
-                "evidence": [], "query_interpretation": interpretation,
-            }
 
-        ranked_entries = self._rank_files(groups, intent, forced_file_id=file_id)
-        chosen_entry = ranked_entries[0]
-        chosen_result: Optional[Dict[str, Any]] = None
-        last_parse_error: Optional[Tuple[FileEntry, Exception]] = None
+        if validated.get("status") == "answered":
+            self.history.append({
+                "question": question,
+                "file_id": validated.get("file_id"),
+                "file": validated.get("file"),
+                "answer": validated.get("value", validated.get("answer")),
+                "unit": validated.get("unit"),
+                "explanation": validated.get("reason"),
+            })
+            if len(self.history) > 12:
+                self.history = self.history[-12:]
 
-        for candidate in ranked_entries:
-            try:
-                candidate_result = self._answer_with_entry(candidate, parser_question, intent, plan)
-            except Exception as exc:
-                last_parse_error = (candidate, exc)
-                if file_id is not None and candidate.file_id == file_id:
-                    break
-                continue
-
-            validated = self._validate_answer(candidate_result, intent)
-            if chosen_result is None:
-                chosen_entry = candidate
-                chosen_result = validated
-            if validated.get("status") in {"answered", "clarification_required"}:
-                chosen_entry = candidate
-                chosen_result = validated
-                break
-            # If the user explicitly forced a single file_id, do not silently switch files.
-            if file_id is not None and candidate.file_id == file_id:
-                break
-
-        if chosen_result is None and last_parse_error is not None:
-            failed_entry, exc = last_parse_error
-            return {
-                "status": "not_found", "answer": None,
-                "reason": f"Could not parse {failed_entry.path.name}: {type(exc).__name__}: {exc}",
-                "evidence": [], "file_id": failed_entry.file_id,
-                "query_interpretation": interpretation,
-            }
-
-        assert chosen_result is not None
-        result = dict(chosen_result)
-        result["file_id"] = chosen_entry.file_id
-        result["file"] = chosen_entry.path.name
-        result["format"] = chosen_entry.format
-        result["drawing_type"] = chosen_entry.drawing_type
-        result["related_files"] = [self.files[item].path.name for item in groups if item != chosen_entry.file_id]
-        result["query_interpretation"] = interpretation
-        return result
+        return validated
 
     def close(self) -> None:
         """Release this conversation's in-memory file metadata and parse cache."""
         with self._lock:
             self.files.clear()
             self._groups.clear()
-            self._active_group = None
+            self.history.clear()
             self.classification_warnings.clear()
             self._vision_classifier = None

@@ -555,18 +555,17 @@ def _cubicasa_prediction(image_path: str | Path, repo_path: str | Path, weights_
                     "Sink", "Sauna bench", "Fireplace", "Bathtub", "Chimney")
     scale_x, scale_y = original_width / resized_size[0], original_height / resized_size[1]
 
-    def regions(probabilities, names, min_area, room=False):
+    def regions(probabilities, names, min_area, allowed_names=None, excluded_names=None):
         labels = probabilities.argmax(axis=0)
         result = []
         for class_id, name in enumerate(names):
             if class_id == 0:
                 continue
+            if allowed_names is not None and name not in allowed_names:
+                continue
+            if excluded_names is not None and name in excluded_names:
+                continue
             mask = labels == class_id
-            if room:
-                # The upstream room labels include the whole wall/room polygon;
-                # exclude the common structural classes from room-object results.
-                if name in {"Outdoor", "Wall", "Railing"}:
-                    continue
             for component in _connected_components(mask, min_area):
                 x0, y0, x1, y1 = (component[k] for k in ("x0", "y0", "x1", "y1"))
                 confidence = float(probabilities[class_id, y0:y1, x0:x1].mean())
@@ -580,8 +579,10 @@ def _cubicasa_prediction(image_path: str | Path, repo_path: str | Path, weights_
                 })
         return result
 
+    min_room_area = max(36, int(round(0.0035 * resized_size[0] * resized_size[1])))
     prediction = {
-        "rooms": regions(room_prob, room_classes, 12, room=True),
+        "rooms": regions(room_prob, room_classes, min_room_area, excluded_names={"Outdoor", "Wall", "Railing"}),
+        "outdoor_spaces": regions(room_prob, room_classes, min_room_area, allowed_names={"Outdoor"}),
         "icons": regions(icon_prob, icon_classes, 3),
         "model": "CubiCasa5K model_best_val_loss_var",
     }
@@ -591,6 +592,74 @@ def _cubicasa_prediction(image_path: str | Path, repo_path: str | Path, weights_
         _CUBICASA_PREDICTION_CACHE.pop(next(iter(_CUBICASA_PREDICTION_CACHE)))
     _CUBICASA_PREDICTION_CACHE[key] = prediction
     return prediction
+
+
+def enrich_image_specialist_evidence(
+    document: Dict[str, Any],
+    *,
+    cubicasa_repo_path: str | Path | None = None,
+    cubicasa_weights_path: str | Path | None = None,
+    geometry_model_path: str | Path | None = None,
+) -> Dict[str, Any]:
+    """Attach cached floor-plan segmentation and 4-orientation room-label OCR to a parsed image."""
+    source = document.get("source", {}).get("path")
+    drawing_type = document.get("drawing_type")
+    if not source or drawing_type in _NON_FLOORPLAN_TYPES:
+        return document
+
+    if "floorplan_specialist" not in document:
+        if cubicasa_repo_path is None and cubicasa_weights_path is None:
+            cubicasa_repo_path, cubicasa_weights_path = default_cubicasa_paths()
+        if cubicasa_repo_path is not None and cubicasa_weights_path is not None:
+            try:
+                document["floorplan_specialist"] = _cubicasa_prediction(
+                    source, cubicasa_repo_path, cubicasa_weights_path
+                )
+            except Exception as exc:
+                document["floorplan_specialist_error"] = f"{type(exc).__name__}: {exc}"
+        elif geometry_model_path is not None:
+            try:
+                geom = _geometry_prediction(source, geometry_model_path)
+                excluded = {"background", "outdoor", "wall", "railing"}
+                document["floorplan_specialist"] = {
+                    "rooms": [
+                        r for r in geom.get("rooms", [])
+                        if str(r.get("class", "")).casefold() not in excluded
+                    ],
+                    "outdoor_spaces": [
+                        r for r in geom.get("rooms", [])
+                        if str(r.get("class", "")).casefold() == "outdoor"
+                    ],
+                    "icons": geom.get("icons", []),
+                    "model": "floorplan_geometry_checkpoint",
+                }
+            except Exception as exc:
+                document["floorplan_specialist_error"] = f"{type(exc).__name__}: {exc}"
+
+    if "ocr_room_labels" not in document:
+        try:
+            from room_label_qa import SUPPORTED as ROOM_OCR_SUPPORTED, _hits, read_labels
+            width = int(document.get("width") or 0)
+            height = int(document.get("height") or 0)
+            if width > 0 and height > 0:
+                rot_labels = read_labels(source)
+                extracted: List[Dict[str, Any]] = []
+                for cat in ROOM_OCR_SUPPORTED:
+                    if cat == "storeys":
+                        continue
+                    for hit in _hits(rot_labels, cat, (width, height)):
+                        extracted.append({
+                            "category": cat,
+                            "label": hit["label"],
+                            "ocr_text": hit["ocr_text"],
+                            "confidence": hit["conf"],
+                            "bbox": hit["bbox"],
+                        })
+                document["ocr_room_labels"] = extracted
+        except Exception:
+            document["ocr_room_labels"] = []
+
+    return document
 
 
 def _answer_raster_text_question(question: str, document: Dict[str, Any]) -> Optional[Dict[str, Any]]:

@@ -34,6 +34,7 @@ format: IFC > DXF > vector PDF > raster image.
 | `conversation_pipeline.py` | per-conversation file manifest, parser cache, and question router | Codex |
 | `chat_api.py` | conversation-scoped REST upload and question API | Codex |
 | `llm_query_planner.py` | optional LLM query planning with schema validation | Codex |
+| `llm_reasoner.py` | structured parser EvidencePacks + grounded LLM reasoning | Duc |
 
 Only edit files you own. If you must change someone else's file, keep the diff minimal and
 say so in the PR description.
