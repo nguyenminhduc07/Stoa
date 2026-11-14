@@ -6,3 +6,4 @@
 - 2026-11-14 - Fixture rules: rounded-rect basin >=1.2 m = bathtub; elliptical bowl with drain circle = washbasin, without = toilet; rectangular tray with drain = shower - consistent drawing convention, 1614/1614 counts on preview.
 - 2026-11-14 - Unnamed numbered rooms are included in apartment/floor totals - source room type is not drawn; accounts for the remaining 20/744 area misses.
 - 2026-11-14 - CubiCasa room-type questions answered by OCR of Finnish room labels (RapidOCR, 4 orientations, merged) - preview: bedrooms 70%, balconies 88%, WC rooms 69%, saunas 64%, storeys 84%; kitchens/bathrooms answer the typical value 1 (95%/88%) because OCR was worse than that; flagged review_recommended.
+- 2026-11-14 - Uploaded-file parsing and cache are scoped to a conversation instance and lazy-loaded; this avoids persistent storage while isolating chats.

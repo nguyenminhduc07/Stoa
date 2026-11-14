@@ -30,6 +30,7 @@ format: IFC > DXF > vector PDF > raster image.
 | `evaluate_all.py` | routes every question to its answerer, one overall score | Minh |
 | `room_label_qa.py` | CubiCasa room-type counts from OCR of room labels | Minh |
 | _(add yours here)_ | | |
+| `conversation_pipeline.py` | per-conversation file manifest, parser cache, and question router | Codex |
 
 Only edit files you own. If you must change someone else's file, keep the diff minimal and
 say so in the PR description.
