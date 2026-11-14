@@ -28,7 +28,7 @@ format: IFC > DXF > vector PDF > raster image.
 | `image_parser.py`, `floorplan_model.py`, `floorplan_geometry_model.py`, `train_floorplan*.py`, `prepare_cubicasa_masks.py` | raster evidence and floor-plan CNNs | Codex |
 | `cad_qa.py` / `evaluate_cad.py` | DXF floor-plan answers (Swiss dwellings) + eval | Minh |
 | `evaluate_all.py` | routes every question to its answerer, one overall score | Minh |
-| _(add yours here)_ | | |
+| `conversation_pipeline.py` | per-conversation file manifest, parser cache, and question router | Codex |
 
 Only edit files you own. If you must change someone else's file, keep the diff minimal and
 say so in the PR description.
