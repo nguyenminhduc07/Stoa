@@ -20,12 +20,13 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from conversation_pipeline import ConversationPipeline
+from llm_reasoner import get_env_setting
 
 
 SESSION_ROOT = Path(
-    os.environ.get("STOA_SESSION_DIR", str(Path(tempfile.gettempdir()) / "stoa-conversations"))
+    get_env_setting("STOA_SESSION_DIR") or str(Path(tempfile.gettempdir()) / "stoa-conversations")
 ).expanduser().resolve()
-MAX_UPLOAD_BYTES = max(1, int(os.environ.get("STOA_MAX_UPLOAD_MB", "1024"))) * 1024 * 1024
+MAX_UPLOAD_BYTES = max(1, int(get_env_setting("STOA_MAX_UPLOAD_MB") or "1024")) * 1024 * 1024
 COPY_CHUNK_BYTES = 1024 * 1024
 
 
@@ -102,11 +103,11 @@ def create_conversation():
     directory = SESSION_ROOT / conversation_id
     directory.mkdir(parents=True, exist_ok=False)
     pipeline = ConversationPipeline(
-        count_model=os.environ.get("STOA_COUNT_MODEL"),
-        geometry_model=os.environ.get("STOA_GEOMETRY_MODEL"),
-        cubicasa_repo=os.environ.get("STOA_CUBICASA_REPO"),
-        cubicasa_weights=os.environ.get("STOA_CUBICASA_WEIGHTS"),
-        object_detector_model=os.environ.get("STOA_OBJECT_DETECTOR_MODEL"),
+        count_model=get_env_setting("STOA_COUNT_MODEL"),
+        geometry_model=get_env_setting("STOA_GEOMETRY_MODEL"),
+        cubicasa_repo=get_env_setting("STOA_CUBICASA_REPO"),
+        cubicasa_weights=get_env_setting("STOA_CUBICASA_WEIGHTS"),
+        object_detector_model=get_env_setting("STOA_OBJECT_DETECTOR_MODEL"),
         render_dir=directory / "_renders",
     )
     with _sessions_lock:

@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 from pathlib import Path
+import html as _html
 import math
+import os
 import re
 import struct
 import sys
+import threading
 import unicodedata
+import urllib.parse
+import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
 
 from floorplan_model import CATEGORY_NAMES, MODEL_VERSION, SharedFloorplanCounter, require_torch
@@ -18,6 +23,7 @@ from floorplan_geometry_model import (
     ROOM_CLASSES,
     ROOM_COUNT_CLASS,
     FloorplanGeometryNet,
+    FurukawaHourglass,
 )
 
 
@@ -27,7 +33,11 @@ _COUNT_MODEL_CACHE: Dict[str, Tuple[Any, Any, int]] = {}
 _GEOMETRY_MODEL_CACHE: Dict[str, Tuple[Any, Any, Any]] = {}
 _CUBICASA_MODEL_CACHE: Dict[Tuple[str, str], Tuple[Any, Any, Any]] = {}
 _CUBICASA_PREDICTION_CACHE: Dict[Tuple[str, str, str, int, int], Dict[str, Any]] = {}
+_GEOMETRIC_ANALYSIS_CACHE: Dict[Tuple[str, int, int], Dict[str, Any]] = {}
 _OBJECT_DETECTOR_CACHE: Dict[str, Any] = {}
+_CUBICASA_DOWNLOAD_LOCK = threading.Lock()
+_CUBICASA_DOWNLOAD_ATTEMPTED = False
+_CUBICASA_GDRIVE_FILE_ID = "1gRB7ez1e4H7a9Y09lLqRuna0luZO5VRK"
 _RAPID_OCR = None
 _DIMENSION_PATTERN = re.compile(
     r"(?<![A-Za-z0-9])(?:\d{1,3}(?:[ ,]\d{3})+|\d+)(?:[.,]\d+)?\s*(?:mm|cm|ft|feet|inches|inch|in|m)(?![A-Za-z])",
@@ -35,14 +45,133 @@ _DIMENSION_PATTERN = re.compile(
 )
 
 
+def _read_setting(name: str) -> Optional[str]:
+    val = os.environ.get(name)
+    if val and val.strip():
+        return val.strip()
+    try:
+        from llm_reasoner import get_env_setting
+        return get_env_setting(name)
+    except Exception:
+        return None
+
+
+def _auto_download_cubicasa_weights(target_path: Path) -> Optional[Path]:
+    """Download the official CubiCasa5K checkpoint on first use when network is available."""
+    global _CUBICASA_DOWNLOAD_ATTEMPTED
+    with _CUBICASA_DOWNLOAD_LOCK:
+        if target_path.is_file() and target_path.stat().st_size >= 100_000_000:
+            return target_path
+        if _CUBICASA_DOWNLOAD_ATTEMPTED:
+            return None
+        _CUBICASA_DOWNLOAD_ATTEMPTED = True
+
+        try:
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            part_path = target_path.with_suffix(".pkl.part")
+            url = (
+                f"https://drive.usercontent.google.com/download"
+                f"?id={_CUBICASA_GDRIVE_FILE_ID}&export=download&confirm=t"
+            )
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=8.0) as resp:
+                ctype = str(resp.headers.get("Content-Type") or "").lower()
+                first_chunk = resp.read(65536)
+                if "text/html" in ctype or first_chunk.lstrip().startswith((b"<!DOCTYPE", b"<html", b"<HTML")):
+                    page_html = (first_chunk + resp.read(262144)).decode("utf-8", errors="ignore")
+                    action_m = re.search(r'<form[^>]+action="([^"]+)"', page_html)
+                    inputs = dict(re.findall(r'<input[^>]+name="([^"]+)"[^>]+value="([^"]*)"', page_html))
+                    if not action_m:
+                        return None
+                    confirm_url = _html.unescape(action_m.group(1))
+                    if inputs:
+                        sep = "&" if "?" in confirm_url else "?"
+                        confirm_url = confirm_url + sep + urllib.parse.urlencode(inputs)
+                    req2 = urllib.request.Request(confirm_url, headers={"User-Agent": "Mozilla/5.0"})
+                    with urllib.request.urlopen(req2, timeout=15.0) as resp2:
+                        head = resp2.read(65536)
+                        if not head.startswith((b"\x80", b"PK\x03\x04")):
+                            return None
+                        with part_path.open("wb") as out:
+                            out.write(head)
+                            while True:
+                                buf = resp2.read(1024 * 1024)
+                                if not buf:
+                                    break
+                                out.write(buf)
+                else:
+                    if not first_chunk.startswith((b"\x80", b"PK\x03\x04")):
+                        return None
+                    with part_path.open("wb") as out:
+                        out.write(first_chunk)
+                        while True:
+                            buf = resp.read(1024 * 1024)
+                            if not buf:
+                                break
+                            out.write(buf)
+
+            if part_path.is_file() and part_path.stat().st_size >= 100_000_000:
+                os.replace(part_path, target_path)
+                return target_path
+            if part_path.exists():
+                part_path.unlink(missing_ok=True)
+        except Exception:
+            try:
+                target_path.with_suffix(".pkl.part").unlink(missing_ok=True)
+            except Exception:
+                pass
+        return None
+
+
+def resolve_cubicasa_weights(
+    weights_path: str | Path | None = None,
+    *,
+    auto_download: bool = True,
+) -> Optional[Path]:
+    """Locate CubiCasa5K weights across explicit, env, local data/, or cache paths."""
+    if weights_path is not None:
+        explicit = Path(weights_path).expanduser()
+        return explicit.resolve() if explicit.is_file() else None
+
+    env_weights = _read_setting("STOA_CUBICASA_WEIGHTS")
+    if env_weights:
+        env_p = Path(env_weights).expanduser()
+        if env_p.is_file():
+            return env_p.resolve()
+
+    here = Path(__file__).resolve().parent
+    candidates = [
+        here / "data" / "model_best_val_loss_var.pkl",
+        Path.cwd() / "data" / "model_best_val_loss_var.pkl",
+        here.parent / "data" / "model_best_val_loss_var.pkl",
+        Path.home() / "Stoa" / "data" / "model_best_val_loss_var.pkl",
+        Path.home() / "data" / "model_best_val_loss_var.pkl",
+        Path.home() / ".cache" / "stoa" / "model_best_val_loss_var.pkl",
+    ]
+    for cand in candidates:
+        try:
+            if cand.is_file() and cand.stat().st_size >= 100_000_000:
+                return cand.resolve()
+        except OSError:
+            continue
+
+    allow_dl = (_read_setting("STOA_AUTO_DOWNLOAD_CUBICASA") or "1").strip().lower() not in {"0", "false", "no"}
+    if auto_download and allow_dl:
+        return _auto_download_cubicasa_weights(here / "data" / "model_best_val_loss_var.pkl")
+    return None
+
+
 def default_cubicasa_paths() -> Tuple[Optional[Path], Optional[Path]]:
-    """Return local CubiCasa5K repo and weights paths when present in data/."""
-    root = Path(__file__).resolve().parent / "data"
-    repo = root / "CubiCasa5k"
-    weights = root / "model_best_val_loss_var.pkl"
-    if (repo / "floortrans" / "models" / "hg_furukawa_original.py").is_file() and weights.is_file():
-        return repo, weights
-    return None, None
+    """Return optional CubiCasa5K repo path and resolved checkpoint path."""
+    here = Path(__file__).resolve().parent
+    env_repo = _read_setting("STOA_CUBICASA_REPO")
+    repo: Optional[Path] = None
+    for cand in ([Path(env_repo).expanduser()] if env_repo else []) + [here / "data" / "CubiCasa5k"]:
+        if (cand / "floortrans" / "models" / "hg_furukawa_original.py").is_file():
+            repo = cand.resolve()
+            break
+    weights = resolve_cubicasa_weights()
+    return repo, weights
 
 
 def ocr_image_array(image: Any) -> Tuple[str, List[Dict[str, Any]]]:
@@ -476,26 +605,26 @@ def _geometry_prediction(
 
 
 
-def _load_cubicasa_model(repo_path: str | Path, weights_path: str | Path):
-    """Load the official CubiCasa5K model and its published checkpoint."""
+def _load_cubicasa_model(repo_path: str | Path | None, weights_path: str | Path):
+    """Load the 44-channel CubiCasa5K model (using built-in FurukawaHourglass when repo is absent)."""
     torch = require_torch()
-    repo = Path(repo_path).expanduser().resolve()
     weights = Path(weights_path).expanduser().resolve()
-    key = (str(repo), str(weights))
-    if key in _CUBICASA_MODEL_CACHE:
-        return _CUBICASA_MODEL_CACHE[key]
-    if not (repo / "floortrans" / "models" / "hg_furukawa_original.py").is_file():
-        raise FileNotFoundError(f"CubiCasa5K checkout is missing floortrans/models: {repo}")
     if not weights.is_file():
         raise FileNotFoundError(f"CubiCasa5K pretrained checkpoint not found: {weights}")
-    repo_text = str(repo)
-    if repo_text not in sys.path:
-        sys.path.insert(0, repo_text)
-    # Instantiate the official architecture directly. The released CubiCasa
-    # checkpoint contains every parameter, so inference does not need to load
-    # the separate ImageNet/pose initialization weights used before training.
-    from floortrans.models.hg_furukawa_original import hg_furukawa_original
-    model = hg_furukawa_original(44)
+    repo = Path(repo_path).expanduser().resolve() if repo_path else None
+    repo_key = str(repo) if (repo and (repo / "floortrans" / "models" / "hg_furukawa_original.py").is_file()) else "__builtin__"
+    key = (repo_key, str(weights))
+    if key in _CUBICASA_MODEL_CACHE:
+        return _CUBICASA_MODEL_CACHE[key]
+
+    if repo_key != "__builtin__" and repo is not None:
+        repo_text = str(repo)
+        if repo_text not in sys.path:
+            sys.path.insert(0, repo_text)
+        from floortrans.models.hg_furukawa_original import hg_furukawa_original
+        model = hg_furukawa_original(44)
+    else:
+        model = FurukawaHourglass(44)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     try:
@@ -511,7 +640,7 @@ def _load_cubicasa_model(repo_path: str | Path, weights_path: str | Path):
     return loaded
 
 
-def _cubicasa_prediction(image_path: str | Path, repo_path: str | Path, weights_path: str | Path):
+def _cubicasa_prediction(image_path: str | Path, repo_path: str | Path | None, weights_path: str | Path):
     """Run official 44-channel CubiCasa inference and return localized classes."""
     torch = require_torch()
     import numpy as np
@@ -521,14 +650,14 @@ def _cubicasa_prediction(image_path: str | Path, repo_path: str | Path, weights_
         raise RuntimeError("CubiCasa inference requires Pillow: pip install pillow") from exc
 
     image_file = Path(image_path).expanduser().resolve()
-    repo = str(Path(repo_path).expanduser().resolve())
+    repo_key = str(Path(repo_path).expanduser().resolve()) if repo_path else "__builtin__"
     weights = str(Path(weights_path).expanduser().resolve())
     stat = image_file.stat()
-    key = (str(image_file), repo, weights, stat.st_size, stat.st_mtime_ns)
+    key = (str(image_file), repo_key, weights, stat.st_size, stat.st_mtime_ns)
     if key in _CUBICASA_PREDICTION_CACHE:
         return _CUBICASA_PREDICTION_CACHE[key]
 
-    model, device, _checkpoint = _load_cubicasa_model(repo, weights)
+    model, device, _checkpoint = _load_cubicasa_model(repo_path, weights)
     with Image.open(image_path) as source_image:
         image = ImageOps.exif_transpose(source_image).convert("RGB")
         original_width, original_height = image.size
@@ -594,26 +723,296 @@ def _cubicasa_prediction(image_path: str | Path, repo_path: str | Path, weights_
     return prediction
 
 
+def analyze_floorplan_geometry(image_path: str | Path) -> Dict[str, Any]:
+    """Extract wall topology, orthogonal alignment, and enclosed room regions purely from geometry.
+
+    Small isolated connected components (text glyphs, dimension numbers, stipples) are removed
+    before wall-footprint and distance-transform watershed analysis so text never influences
+    room segmentation or floor-plan classification.
+    """
+    image_file = Path(image_path).expanduser().resolve()
+    stat = image_file.stat()
+    cache_key = (str(image_file), stat.st_size, stat.st_mtime_ns)
+    if cache_key in _GEOMETRIC_ANALYSIS_CACHE:
+        return _GEOMETRIC_ANALYSIS_CACHE[cache_key]
+
+    try:
+        import cv2
+        import numpy as np
+        from PIL import Image, ImageOps
+    except ImportError:
+        return {
+            "is_floor_plan": False,
+            "is_schedule_grid": False,
+            "is_photo": False,
+            "rooms": [],
+            "outdoor_spaces": [],
+            "icons": [],
+            "thick_wall_ratio": 0.0,
+            "ortho_energy": 0.0,
+            "model": "geometric_wall_watershed",
+        }
+
+    with Image.open(image_file) as src_img:
+        rgb0 = np.asarray(ImageOps.exif_transpose(src_img).convert("RGB"))
+    h0, w0 = rgb0.shape[:2]
+    scale = min(1.0, 800.0 / float(max(h0, w0, 1)))
+    if scale < 1.0:
+        w = max(64, int(round(w0 * scale)))
+        h = max(64, int(round(h0 * scale)))
+        img = cv2.resize(rgb0, (w, h), interpolation=cv2.INTER_AREA)
+    else:
+        img = rgb0
+        h, w = h0, w0
+
+    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+    sat = cv2.cvtColor(img, cv2.COLOR_RGB2HSV)[..., 1]
+
+    light_ratio = float((gray >= 200).mean())
+    mid_photo_ratio = float(((gray >= 55) & (gray < 195) & (sat >= 55)).mean())
+
+    # Dark low-saturation ink (walls/partitions); excludes bright colored site contours & fills
+    ink_all = (((gray < 165) & (sat < 85)) | (gray < 95)).astype(np.uint8) * 255
+
+    # Strip full-page sheet border lines along outer 3% margins so sheet borders do not trap flood-fill
+    m_x = max(4, int(round(0.03 * w)))
+    m_y = max(4, int(round(0.03 * h)))
+    work_ink = ink_all.copy()
+    for y0_b, y1_b in ((0, m_y), (h - m_y, h)):
+        row_cov = (work_ink[y0_b:y1_b, :] > 0).mean(axis=1)
+        for ry in np.where(row_cov > 0.55)[0]:
+            yi = y0_b + int(ry)
+            work_ink[max(0, yi - 2):min(h, yi + 3), :] = 0
+    for x0_b, x1_b in ((0, m_x), (w - m_x, w)):
+        col_cov = (work_ink[:, x0_b:x1_b] > 0).mean(axis=0)
+        for rx in np.where(col_cov > 0.55)[0]:
+            xi = x0_b + int(rx)
+            work_ink[:, max(0, xi - 2):min(w, xi + 3)] = 0
+
+    # Erase isolated text characters & small symbols (< 3.8% of minor image dimension)
+    num_cc, cc_labels, cc_stats, _ = cv2.connectedComponentsWithStats(work_ink, connectivity=8)
+    min_span = max(14, int(round(0.038 * min(h, w))))
+    min_area = max(24, int(round(0.00022 * h * w)))
+    keep = np.zeros(num_cc, dtype=bool)
+    if num_cc > 1:
+        spans = np.maximum(cc_stats[1:, cv2.CC_STAT_WIDTH], cc_stats[1:, cv2.CC_STAT_HEIGHT])
+        areas = cc_stats[1:, cv2.CC_STAT_AREA]
+        keep[1:] = (spans >= min_span) & (areas >= min_area)
+    clean_wall = (keep[cc_labels].astype(np.uint8)) * 255
+
+    thick_px = max(3, int(round(0.005 * min(h, w))))
+    thick_wall = cv2.morphologyEx(
+        clean_wall, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (thick_px, thick_px))
+    )
+    thick_wall_ratio = float((thick_wall > 0).sum()) / float(max((clean_wall > 0).sum(), 1))
+
+    gx = cv2.Sobel(clean_wall, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(clean_wall, cv2.CV_32F, 0, 1, ksize=3)
+    mag = np.hypot(gx, gy)
+    strong = mag > 40.0
+    if np.any(strong):
+        ang180 = (np.degrees(np.arctan2(gy[strong], gx[strong]))) % 180.0
+        bins180 = np.histogram(ang180, bins=36, range=(0.0, 180.0), weights=mag[strong])[0]
+        total_w = float(bins180.sum()) + 1e-6
+        ortho_pairs = bins180[:18] + bins180[18:]
+        best_idx = int(np.argmax(ortho_pairs))
+        idx_set = [(best_idx - 1) % 18, best_idx, (best_idx + 1) % 18]
+        axis_a = sum(float(bins180[i]) for i in idx_set) / total_w
+        axis_b = sum(float(bins180[i + 18]) for i in idx_set) / total_w
+        ortho_energy = axis_a + axis_b
+        ortho_balance = min(axis_a, axis_b) / max(axis_a, axis_b, 1e-6)
+    else:
+        ortho_energy = 0.0
+        ortho_balance = 0.0
+
+    ys, xs = np.where(clean_wall > 0)
+    rooms: List[Dict[str, Any]] = []
+    footprint_ratio = 0.0
+    if len(xs) >= 90:
+        bx0, bx1 = int(np.percentile(xs, 2)), int(np.percentile(xs, 98))
+        by0, by1 = int(np.percentile(ys, 2)), int(np.percentile(ys, 98))
+        b_span = max(48, min(bx1 - bx0, by1 - by0))
+
+        outer_gap = max(11, int(round(0.085 * b_span))) | 1
+        envelope = cv2.morphologyEx(
+            clean_wall, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (outer_gap, outer_gap))
+        )
+        padded = np.zeros((h + 4, w + 4), dtype=np.uint8)
+        padded[2:h + 2, 2:w + 2] = envelope
+        ff = padded.copy()
+        cv2.floodFill(ff, np.zeros((h + 6, w + 6), dtype=np.uint8), (0, 0), 128)
+        footprint = ~(ff[2:h + 2, 2:w + 2] == 128)
+        footprint_area = int(footprint.sum())
+        footprint_ratio = footprint_area / float(h * w)
+
+        if footprint_area >= 0.015 * h * w:
+            interior_free = footprint & (clean_wall == 0)
+            dist = cv2.distanceTransform((interior_free.astype(np.uint8)) * 255, cv2.DIST_L2, 5)
+            sigma = max(1.5, 0.006 * b_span)
+            dist_smooth = cv2.GaussianBlur(dist, (0, 0), sigmaX=sigma, sigmaY=sigma)
+
+            min_peak_dist = max(11, int(round(0.075 * b_span))) | 1
+            dilated = cv2.dilate(
+                dist_smooth, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (min_peak_dist, min_peak_dist))
+            )
+            min_room_radius = max(4.5, 0.022 * b_span)
+            local_max = (dist_smooth >= dilated - 1e-4) & (dist_smooth >= min_room_radius) & interior_free
+
+            n_pk, pk_labels = cv2.connectedComponents(local_max.astype(np.uint8), connectivity=8)
+            ws_markers = np.where(pk_labels > 0, pk_labels + 1, 0).astype(np.int32)
+            ws_markers[~interior_free] = 1
+
+            inv_dist = np.clip(
+                255.0 - (dist_smooth / max(float(dist_smooth.max()), 1.0)) * 255.0, 0, 255
+            ).astype(np.uint8)
+            cv2.watershed(cv2.cvtColor(inv_dist, cv2.COLOR_GRAY2BGR), ws_markers)
+
+            basin_peak = np.zeros(n_pk + 2, dtype=np.float32)
+            valid_b = ws_markers >= 2
+            if np.any(valid_b):
+                np.maximum.at(basin_peak, ws_markers[valid_b], dist[valid_b])
+
+            ridge_ys, ridge_xs = np.where((ws_markers == -1) & interior_free)
+            pair_max_saddle: Dict[Tuple[int, int], float] = {}
+            if len(ridge_xs) > 0:
+                valid_r = (ridge_ys >= 1) & (ridge_ys < h - 1) & (ridge_xs >= 1) & (ridge_xs < w - 1)
+                ry, rx = ridge_ys[valid_r], ridge_xs[valid_r]
+                rd = dist[ry, rx]
+                for l1_arr, l2_arr in (
+                    (ws_markers[ry, rx - 1], ws_markers[ry, rx + 1]),
+                    (ws_markers[ry - 1, rx], ws_markers[ry + 1, rx]),
+                ):
+                    diff_m = (l1_arr >= 2) & (l2_arr >= 2) & (l1_arr != l2_arr)
+                    for a, b, dval in zip(l1_arr[diff_m].tolist(), l2_arr[diff_m].tolist(), rd[diff_m].tolist()):
+                        key_ab = (a, b) if a < b else (b, a)
+                        if dval > pair_max_saddle.get(key_ab, 0.0):
+                            pair_max_saddle[key_ab] = dval
+
+            parent = list(range(n_pk + 2))
+
+            def _find(x: int) -> int:
+                while parent[x] != x:
+                    parent[x] = parent[parent[x]]
+                    x = parent[x]
+                return x
+
+            for (a, b), saddle in pair_max_saddle.items():
+                min_pk = min(float(basin_peak[a]), float(basin_peak[b]))
+                if min_pk > 0 and (saddle / min_pk) >= 0.76:
+                    ra, rb = _find(a), _find(b)
+                    if ra != rb:
+                        parent[max(ra, rb)] = min(ra, rb)
+
+            remap = np.array([_find(i) if i >= 2 else 0 for i in range(n_pk + 2)], dtype=np.int32)
+            labels_map = remap[np.where(ws_markers >= 2, ws_markers, 0)]
+
+            min_room_px = max(85, int(round(0.008 * footprint_area)))
+            inv_scale = 1.0 / scale
+            if labels_map.max() >= 2:
+                counts = np.bincount(labels_map.ravel())
+                for rid in np.where(counts >= min_room_px)[0]:
+                    if rid < 2:
+                        continue
+                    reg = labels_map == rid
+                    area_px = int(counts[rid])
+                    rys, rxs = np.where(reg)
+                    rx0, ry0, rx1, ry1 = int(rxs.min()), int(rys.min()), int(rxs.max()), int(rys.max())
+                    rw, rh = rx1 - rx0 + 1, ry1 - ry0 + 1
+                    aspect = max(rw, rh) / max(min(rw, rh), 1)
+                    fill_frac = area_px / float(max(rw * rh, 1))
+                    if aspect > 8.5 or fill_frac < 0.20:
+                        continue
+                    rooms.append({
+                        "class": "Room",
+                        "confidence": 0.70,
+                        "bbox": [
+                            max(0, int(round(rx0 * inv_scale))),
+                            max(0, int(round(ry0 * inv_scale))),
+                            min(w0, int(round((rx1 + 1) * inv_scale))),
+                            min(h0, int(round((ry1 + 1) * inv_scale))),
+                        ],
+                        "area_px": int(round(area_px * inv_scale * inv_scale)),
+                        "_h_px": rh,
+                    })
+
+    horiz_k = cv2.getStructuringElement(cv2.MORPH_RECT, (max(35, w // 5), 1))
+    vert_k = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(35, h // 5)))
+    h_grid = cv2.morphologyEx(clean_wall, cv2.MORPH_OPEN, horiz_k) > 0
+    v_grid = cv2.morphologyEx(clean_wall, cv2.MORPH_OPEN, vert_k) > 0
+    grid_dominance = float((h_grid | v_grid).sum()) / float(max((clean_wall > 0).sum(), 1))
+
+    h_cv = (
+        float(np.std([r["_h_px"] for r in rooms]) / max(np.mean([r["_h_px"] for r in rooms]), 1.0))
+        if len(rooms) >= 5
+        else 1.0
+    )
+    for r in rooms:
+        r.pop("_h_px", None)
+
+    is_schedule_grid = (
+        (grid_dominance > 0.65 and thick_wall_ratio < 0.03)
+        or (grid_dominance > 0.72 and thick_wall_ratio < 0.18 and (h_cv < 0.28 or len(rooms) > 24))
+    )
+    is_photo = (light_ratio < 0.30 or mid_photo_ratio > 0.32)
+
+    is_floor_plan = (
+        not is_photo
+        and not is_schedule_grid
+        and light_ratio >= 0.38
+        and ortho_energy >= 0.42
+        and ortho_balance >= 0.15
+        and 0.015 <= footprint_ratio <= 0.985
+        and (
+            (len(rooms) >= 2 and (thick_wall_ratio >= 0.06 or ortho_energy >= 0.62))
+            or (len(rooms) >= 1 and thick_wall_ratio >= 0.30 and ortho_energy >= 0.65)
+        )
+    )
+
+    result = {
+        "is_floor_plan": bool(is_floor_plan),
+        "is_schedule_grid": bool(is_schedule_grid),
+        "is_photo": bool(is_photo),
+        "rooms": rooms,
+        "outdoor_spaces": [],
+        "icons": [],
+        "thick_wall_ratio": round(thick_wall_ratio, 4),
+        "ortho_energy": round(ortho_energy, 4),
+        "model": "geometric_wall_watershed",
+    }
+    if len(_GEOMETRIC_ANALYSIS_CACHE) >= 512:
+        _GEOMETRIC_ANALYSIS_CACHE.pop(next(iter(_GEOMETRIC_ANALYSIS_CACHE)))
+    _GEOMETRIC_ANALYSIS_CACHE[cache_key] = result
+    return result
+
+
 def is_likely_floorplan_by_structure(
     image_path: str | Path,
     cubicasa_repo_path: str | Path | None = None,
     cubicasa_weights_path: str | Path | None = None,
 ) -> bool:
-    """Verify floor-plan layout via cached CubiCasa5K room + opening detections."""
-    if cubicasa_repo_path is None and cubicasa_weights_path is None:
-        cubicasa_repo_path, cubicasa_weights_path = default_cubicasa_paths()
-    if cubicasa_repo_path is None or cubicasa_weights_path is None:
+    """Verify floor-plan layout via CubiCasa5K room+opening segmentation or pure wall geometry."""
+    geo = analyze_floorplan_geometry(image_path)
+    if geo.get("is_photo") or geo.get("is_schedule_grid"):
         return False
-    try:
-        pred = _cubicasa_prediction(image_path, cubicasa_repo_path, cubicasa_weights_path)
-    except Exception:
-        return False
-    strong_rooms = [r for r in pred.get("rooms", []) if float(r.get("confidence", 0.0)) >= 0.50]
-    strong_openings = [
-        ic for ic in pred.get("icons", [])
-        if ic.get("class") in {"Door", "Window"} and float(ic.get("confidence", 0.0)) >= 0.50
-    ]
-    return len(strong_rooms) >= 2 and len(strong_openings) >= 2
+
+    weights = resolve_cubicasa_weights(cubicasa_weights_path)
+    if weights is not None:
+        try:
+            pred = _cubicasa_prediction(image_path, cubicasa_repo_path, weights)
+            strong_rooms = [r for r in pred.get("rooms", []) if float(r.get("confidence", 0.0)) >= 0.50]
+            strong_openings = [
+                ic for ic in pred.get("icons", [])
+                if ic.get("class") in {"Door", "Window"} and float(ic.get("confidence", 0.0)) >= 0.50
+            ]
+            if len(strong_rooms) >= 2 and len(strong_openings) >= 2:
+                # Guard against thin-line facade elevations having 2 false rooms when thick walls are absent
+                if len(strong_rooms) >= 3 or geo.get("is_floor_plan") or float(geo.get("thick_wall_ratio", 0.0)) >= 0.05:
+                    return True
+            return False
+        except Exception:
+            pass
+
+    return bool(geo.get("is_floor_plan"))
 
 
 def enrich_image_specialist_evidence(
@@ -631,12 +1030,11 @@ def enrich_image_specialist_evidence(
         return document
 
     if "floorplan_specialist" not in document:
-        if cubicasa_repo_path is None and cubicasa_weights_path is None:
-            cubicasa_repo_path, cubicasa_weights_path = default_cubicasa_paths()
-        if cubicasa_repo_path is not None and cubicasa_weights_path is not None:
+        resolved_weights = resolve_cubicasa_weights(cubicasa_weights_path)
+        if resolved_weights is not None:
             try:
                 document["floorplan_specialist"] = _cubicasa_prediction(
-                    source, cubicasa_repo_path, cubicasa_weights_path
+                    source, cubicasa_repo_path, resolved_weights
                 )
             except Exception as exc:
                 document["floorplan_specialist_error"] = f"{type(exc).__name__}: {exc}"
@@ -658,6 +1056,15 @@ def enrich_image_specialist_evidence(
                 }
             except Exception as exc:
                 document["floorplan_specialist_error"] = f"{type(exc).__name__}: {exc}"
+        else:
+            geo = analyze_floorplan_geometry(source)
+            if geo.get("rooms"):
+                document["floorplan_specialist"] = {
+                    "rooms": geo["rooms"],
+                    "outdoor_spaces": [],
+                    "icons": [],
+                    "model": geo["model"],
+                }
 
     if "ocr_room_labels" not in document:
         try:
@@ -885,8 +1292,11 @@ def answer_image_question(
                 "reason": "This drawing type has OCR support, but no configured detector supports this question.",
                 "evidence": []}
 
-    if cubicasa_repo_path is None and cubicasa_weights_path is None and model_path is None and geometry_model_path is None:
-        cubicasa_repo_path, cubicasa_weights_path = default_cubicasa_paths()
+    resolved_cubicasa_weights = (
+        resolve_cubicasa_weights(cubicasa_weights_path)
+        if model_path is None and geometry_model_path is None
+        else resolve_cubicasa_weights(cubicasa_weights_path, auto_download=False)
+    )
 
     from train_floorplan_model import question_category
 
@@ -920,8 +1330,8 @@ def answer_image_question(
                 "reason": "The image parser cannot isolate a room count to the requested sub-area or level yet.",
                 "evidence": [evidence],
             }
-        if cubicasa_repo_path is not None and cubicasa_weights_path is not None:
-            geometry = _cubicasa_prediction(source, cubicasa_repo_path, cubicasa_weights_path)
+        if resolved_cubicasa_weights is not None:
+            geometry = _cubicasa_prediction(source, cubicasa_repo_path, resolved_cubicasa_weights)
             document["floorplan_specialist"] = geometry
             regions = geometry["rooms"]
             model_name = geometry["model"]
@@ -935,14 +1345,16 @@ def answer_image_question(
             model_name = "floorplan_geometry_checkpoint"
             method = "shared_geometry_indoor_room_components"
         else:
-            return {
-                "status": "unsupported", "answer": None,
-                "reason": (
-                    "Total room counts need the CubiCasa5K checkpoint or the trained geometry model. "
-                    "Configure STOA_CUBICASA_REPO and STOA_CUBICASA_WEIGHTS, then restart the server."
-                ),
-                "evidence": [evidence],
+            geo = analyze_floorplan_geometry(source)
+            regions = geo["rooms"]
+            document["floorplan_specialist"] = {
+                "rooms": regions,
+                "outdoor_spaces": [],
+                "icons": [],
+                "model": geo["model"],
             }
+            model_name = geo["model"]
+            method = "geometric_wall_topology_segmentation"
 
         if not regions:
             return {
@@ -1006,7 +1418,7 @@ def answer_image_question(
             "evidence": formatted_ev,
         }
 
-    if cubicasa_repo_path is not None and cubicasa_weights_path is not None and category:
+    if resolved_cubicasa_weights is not None and category:
         if category == "showers_bathtubs" and any(
                 term in question.casefold() for term in ("shower", "suihku")):
             return {"status": "not_found", "answer": None,
@@ -1027,7 +1439,7 @@ def answer_image_question(
             return {"status": "not_found", "answer": None,
                     "reason": f"CubiCasa5K has no direct segmentation class for {category}.",
                     "evidence": [evidence]}
-        geometry = _cubicasa_prediction(source, cubicasa_repo_path, cubicasa_weights_path)
+        geometry = _cubicasa_prediction(source, cubicasa_repo_path, resolved_cubicasa_weights)
         document["floorplan_specialist"] = geometry
         regions = [item for item in geometry[target[0]] if item["class"] == target[1]]
         region_evidence = [
@@ -1127,7 +1539,7 @@ def answer_image_question(
             "evidence": [evidence],
         }
 
-    if category:
+    if category in {"wc_rooms", "saunas", "balconies", "storeys"}:
         ocr_room_result = _room_label_fallback(category)
         if ocr_room_result is not None:
             return ocr_room_result

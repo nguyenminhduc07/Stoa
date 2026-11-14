@@ -345,7 +345,7 @@ def build_image_evidence_pack(
             "limitations": [
                 "CubiCasa5K segments Bathtubs, Toilets, and Sinks, but has NO Shower icon class (abstain with not_found for standalone shower counts on raster images unless explicitly labeled in text).",
                 "Raster images do not have calibrated metric scale unless printed dimensions explicitly give a measurement; do not fabricate room areas in m2 from pixel areas.",
-                "Do NOT double-count ocr_room_labels (L*) on top of segmented_indoor_rooms (R*) — they observe the same drawing. Use R* for total/general room counts and segmented room types; use L* for label-only categories (wc_rooms, saunas, balconies) or when floorplan_segmentation_available is false.",
+                "NEVER use ocr_room_labels (L*) or ocr_text_lines (T*) to derive total/general room counts, bedroom/kitchen/bathroom counts, or areas — room counts MUST be derived strictly from geometric room regions (R*). Use L* ONLY for label-specific room categories not segmented as separate classes (wc_rooms, saunas, balconies). If floorplan_segmentation_available is false and the user asks for general rooms or geometric room/symbol counts, return action='not_found'.",
             ],
         },
         "total_segmented_indoor_rooms": len(indoor_rooms_cat),
@@ -1193,9 +1193,9 @@ CORE RULES (STRICT):
 1. ZERO HALLUCINATION: Never invent numbers, room names, dimensions, or IDs. Every fact MUST come from the provided EvidencePacks, and `selected_ids` MUST contain the exact `id` strings from the chosen file's EvidencePack.
 2. PYTHON COMPUTES ARITHMETIC:
    - For counting objects/rooms/rows/cohorts (`operation="count_selected"`): select ALL matching IDs in `selected_ids`. Python will sum their counts deterministically!
-     * Example: When asked "how many rooms are there?" on an image floor plan, select ALL indoor room IDs (`R1`, `R2`, ...) across every detected indoor room type (`Bedroom`, `Living Room`, `Kitchen`, `Bath`, `Hallway`, `Storage`, `Garage`, `Other rooms`), excluding `Outdoor` spaces (`O*`) unless outdoor spaces were asked, and NEVER mixing `ocr_room_labels` (`L*`) with `segmented_indoor_rooms` (`R*`).
+     * Example: When asked "how many rooms are there?" on an image floor plan, select ALL indoor room IDs (`R1`, `R2`, ...) across every detected indoor room type (`Bedroom`, `Living Room`, `Kitchen`, `Bath`, `Hallway`, `Storage`, `Garage`, `Other rooms`, `Room`), excluding `Outdoor` spaces (`O*`) unless outdoor spaces were asked. NEVER count `ocr_room_labels` (`L*`) or `ocr_text_lines` (`T*`) to answer general/total room counts — room counts MUST come strictly from geometric room regions (`R*`).
      * Example: When asked "how many rooms excluding hallways and storage?", select all `R*` IDs except `Hallway` and `Storage`.
-     * Example: When asked for WC rooms, saunas, or balconies on a CubiCasa/Finnish raster plan (which lacks segmentation classes for those), select the matching `ocr_room_labels` (`L*`) IDs (note: in Finnish plans, a sauna is paired with washroom `PH`/`PESUH` if `S`/`SAUNA` or washroom label is present; if kitchens or bathrooms are asked on a raster plan where segmentation is unavailable and OCR missed single-letter labels, abstain with `not_found`).
+     * Example: Use `ocr_room_labels` (`L*`) ONLY when asked specifically for WC rooms, saunas, or balconies on a raster plan. If `segmented_indoor_rooms` (`R*`) is empty/unavailable and the user asks for total rooms, bedrooms, kitchens, bathrooms, doors, or windows, return `action="not_found"` — NEVER estimate a room count from text labels!
    - For summing areas, lengths, or volumes (`operation="sum_attribute"`): set `attribute` to `"area_m2"`, `"net_floor_area_m2"`, `"length_m"`, `"side_area_m2"`, or `"volume_m3"`, and list ALL matching IDs in `selected_ids`. Python will sum the exact unrounded floats!
      * If ANY required item/cohort has that attribute missing/null (`missing_quantities`), return `action="not_found"` instead of a partial sum.
    - For largest/smallest (`operation="max_attribute"` or `"min_attribute"`): select the candidate pool in `selected_ids` and set `attribute`. If the user asks for the numeric value, set `unit` (e.g. `"m2"`); if the user asks *which* room/element is largest/smallest, set `direct_answer` to that specific winner's name + value and put ONLY the winning item's ID in `selected_ids` with `operation="direct_value"`.
@@ -1507,6 +1507,7 @@ def execute_reasoning_decision(
     *,
     provider: str = "gemini",
     fallback_options: Optional[List[Dict[str, Any]]] = None,
+    question: str = "",
 ) -> Tuple[Optional[EvidencePack], Dict[str, Any]]:
     """Deterministically compute the answer & ground-truth citations from the LLM's decision."""
     action = str(decision.get("action") or "not_found")
@@ -1608,6 +1609,22 @@ def execute_reasoning_decision(
     review_rec = any(node.review_recommended for node in selected_nodes)
 
     if operation == "count_selected":
+        if pack.format == "image" and selected_nodes and all(
+            n.kind in {"ocr_room_label", "ocr_text_line"} for n in selected_nodes
+        ):
+            q_cf = question.casefold()
+            label_only_cues = (
+                "wc", "restroom", "toilet room", "powder room", "sauna", "löyly", "loyly",
+                "parveke", "balcon", "terrace", "patio", "porch", "deck", "veranda", "loggia",
+                "storey", "storeys", "kerros", "etage", "étage", "geschoss", "korrus", "label", "text",
+            )
+            if question and not any(cue in q_cf for cue in label_only_cues):
+                return pack, {
+                    "status": "not_found",
+                    "answer": None,
+                    "reason": "Room and symbol counts on floor plans must be derived from geometric regions, not partial OCR text labels.",
+                    "evidence": [],
+                }
         total_count = sum(int(node.count) for node in selected_nodes)
         return pack, {
             "status": "answered",

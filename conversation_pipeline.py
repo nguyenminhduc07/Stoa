@@ -170,14 +170,13 @@ class ConversationPipeline:
         render_dir: Optional[str | Path] = None,
         reasoner_fn: Optional[Callable[..., Tuple[Dict[str, Any], str]]] = None,
     ) -> None:
-        if cubicasa_repo is None and cubicasa_weights is None:
+        default_repo, default_weights = None, None
+        if cubicasa_weights is None:
             try:
                 from image_parser import default_cubicasa_paths
                 default_repo, default_weights = default_cubicasa_paths()
             except Exception:
                 default_repo, default_weights = None, None
-        else:
-            default_repo, default_weights = None, None
         self.count_model = Path(count_model) if count_model else None
         self.geometry_model = Path(geometry_model) if geometry_model else None
         self.cubicasa_repo = Path(cubicasa_repo) if cubicasa_repo else default_repo
@@ -257,21 +256,33 @@ class ConversationPipeline:
             return [self._manifest_entry(file_id) for file_id in added]
 
     def _classify_image(self, path: Path, file_id: str) -> str:
-        """Classify an uploaded raster image via dataset provenance, CLIP, or structural segmentation."""
+        """Classify an uploaded raster image via dataset provenance, CLIP, and structural geometry."""
         if any(part.casefold() in {"cubicasa5k", "swiss_dwellings"} for part in path.parts):
             return "floor_plan"
 
         clip_type = "uncertain"
+        best_score = 0.0
         try:
-            import torch
-            from PIL import Image
+            from PIL import Image, ImageOps
             from file_classifier import DocumentRouter
 
             with Image.open(path) as source:
-                image = source.convert("RGB")
+                image = ImageOps.exif_transpose(source).convert("RGB")
 
             if self._vision_classifier is None:
                 try:
+                    from transformers import CLIPModel, CLIPProcessor
+                    try:
+                        clip_model = CLIPModel.from_pretrained(DocumentRouter.IMAGE_MODEL, use_safetensors=True)
+                    except TypeError:
+                        clip_model = CLIPModel.from_pretrained(DocumentRouter.IMAGE_MODEL)
+                    try:
+                        clip_proc = CLIPProcessor.from_pretrained(DocumentRouter.IMAGE_MODEL, use_fast=False)
+                    except TypeError:
+                        clip_proc = CLIPProcessor.from_pretrained(DocumentRouter.IMAGE_MODEL)
+                    clip_model.eval()
+                    self._vision_classifier = ("clip", (clip_model, clip_proc))
+                except Exception:
                     from transformers import pipeline
                     self._vision_classifier = (
                         "pipeline",
@@ -281,37 +292,9 @@ class ConversationPipeline:
                             device=-1,
                         ),
                     )
-                except Exception:
-                    from transformers import CLIPModel, CLIPProcessor
-                    clip_model = CLIPModel.from_pretrained(DocumentRouter.IMAGE_MODEL)
-                    clip_proc = CLIPProcessor.from_pretrained(DocumentRouter.IMAGE_MODEL)
-                    clip_model.eval()
-                    self._vision_classifier = ("clip", (clip_model, clip_proc))
 
-            kind, clf = self._vision_classifier
-            if kind == "pipeline":
-                predictions = clf(image, candidate_labels=DocumentRouter.IMAGE_LABELS)
-            else:
-                clip_model, clip_proc = clf
-                inputs = clip_proc(
-                    text=DocumentRouter.IMAGE_LABELS,
-                    images=image,
-                    return_tensors="pt",
-                    padding=True,
-                )
-                with torch.no_grad():
-                    logits = clip_model(**inputs).logits_per_image[0]
-                    probs = logits.softmax(dim=-1).tolist()
-                predictions = [
-                    {"label": lbl, "score": float(sc)}
-                    for lbl, sc in zip(DocumentRouter.IMAGE_LABELS, probs)
-                ]
-
-            if predictions:
-                scores_by_type: Dict[str, float] = {}
-                for item in predictions:
-                    dtype = DocumentRouter.LABEL_TO_TYPE.get(item["label"], "uncertain")
-                    scores_by_type[dtype] = scores_by_type.get(dtype, 0.0) + float(item["score"])
+            scores_by_type = DocumentRouter.score_clip_image(self._vision_classifier, image)
+            if scores_by_type:
                 ranked = sorted(scores_by_type.items(), key=lambda kv: kv[1], reverse=True)
                 best_type, best_score = ranked[0]
                 second_score = ranked[1][1] if len(ranked) > 1 else 0.0
@@ -325,14 +308,17 @@ class ConversationPipeline:
         except Exception as exc:
             self.classification_warnings[file_id] = f"{type(exc).__name__}: {exc}"
 
-        if clip_type != "uncertain":
+        if clip_type == "floor_plan":
+            self.classification_warnings.pop(file_id, None)
+            return "floor_plan"
+        if clip_type in {"elevation", "section"} and best_score >= 0.32:
             self.classification_warnings.pop(file_id, None)
             return clip_type
 
-        # Structural floor-plan verification fallback using cached CubiCasa5K segmentation
+        # Structural & geometric floor-plan verification (CubiCasa5K segmentation or wall-topology watershed)
         try:
             from image_parser import is_likely_floorplan_by_structure
-            if is_likely_floorplan_by_structure(
+            if (clip_type == "uncertain" or best_score < 0.65) and is_likely_floorplan_by_structure(
                 path,
                 cubicasa_repo_path=self.cubicasa_repo,
                 cubicasa_weights_path=self.cubicasa_weights,
@@ -342,7 +328,9 @@ class ConversationPipeline:
         except Exception:
             pass
 
-        return "uncertain"
+        if clip_type != "uncertain":
+            self.classification_warnings.pop(file_id, None)
+        return clip_type
 
     def _canonical_group(self, group_id: str) -> str:
         if "_plan-" in group_id:
@@ -951,6 +939,7 @@ class ConversationPipeline:
             packs_by_id,
             provider=provider,
             fallback_options=clarification_options,
+            question=question,
         )
         chosen_entry = self.files.get(chosen_pack.file_id) if chosen_pack else self.files.get(packs[0].file_id)
         decorated = self._decorate_entry_metadata(
@@ -1016,7 +1005,7 @@ class ConversationPipeline:
                 forced_file_id=file_id,
                 candidate_entries=group_entries[:2],
             )
-            if llm_res is not None:
+            if llm_res is not None and "not partial OCR text labels" not in str(llm_res.get("reason") or ""):
                 return llm_res
         else:
             llm_err = None

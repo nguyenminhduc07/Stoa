@@ -91,64 +91,119 @@ class DocumentRouter:
         else:
             self.routed_files["unrecognized"].append(str(file_path))
 
-    def _classify_image(self, file_path: Path) -> str:
-        """Classify a raster drawing, using reliable dataset provenance first.
+    def _load_clip_backend(self):
+        if self._image_classifier is not None:
+            return self._image_classifier
+        transformers = import_module("transformers")
+        CLIPModel = getattr(transformers, "CLIPModel", None)
+        CLIPProcessor = getattr(transformers, "CLIPProcessor", None)
+        if CLIPModel is not None and CLIPProcessor is not None:
+            try:
+                model = CLIPModel.from_pretrained(self.IMAGE_MODEL, use_safetensors=True)
+            except TypeError:
+                model = CLIPModel.from_pretrained(self.IMAGE_MODEL)
+            try:
+                proc = CLIPProcessor.from_pretrained(self.IMAGE_MODEL, use_fast=False)
+            except TypeError:
+                proc = CLIPProcessor.from_pretrained(self.IMAGE_MODEL)
+            model.eval()
+            self._image_classifier = ("clip", (model, proc))
+            return self._image_classifier
 
-        Returns a drawing type, or ``uncertain`` when the model cannot make a
-        sufficiently clear choice. Install ``transformers``, ``torch`` and
-        ``Pillow`` to enable zero-shot classification for mixed-source images.
-        The first model use downloads the weights if they are not cached.
-        """
+        pipeline = transformers.pipeline
+        self._image_classifier = (
+            "pipeline",
+            pipeline(task="zero-shot-image-classification", model=self.IMAGE_MODEL),
+        )
+        return self._image_classifier
+
+    @classmethod
+    def score_clip_image(cls, backend, image) -> Dict[str, float]:
+        import torch
+
+        def _single_pass(pil_img) -> Dict[str, float]:
+            kind, obj = backend
+            if kind == "clip":
+                clip_model, clip_proc = obj
+                inputs = clip_proc(
+                    text=cls.IMAGE_LABELS,
+                    images=pil_img,
+                    return_tensors="pt",
+                    padding=True,
+                )
+                with torch.no_grad():
+                    logits = clip_model(**inputs).logits_per_image[0]
+                    probs = logits.softmax(dim=-1).tolist()
+                raw = zip(cls.IMAGE_LABELS, probs)
+            else:
+                preds = obj(pil_img, candidate_labels=cls.IMAGE_LABELS) or []
+                raw = ((p["label"], p["score"]) for p in preds)
+
+            scores: Dict[str, float] = {}
+            for lbl, sc in raw:
+                dtype = cls.LABEL_TO_TYPE.get(lbl, "uncertain")
+                scores[dtype] = scores.get(dtype, 0.0) + float(sc)
+            return scores
+
+        scores0 = _single_pass(image)
+        if not scores0:
+            return {}
+        ranked0 = sorted(scores0.items(), key=lambda kv: kv[1], reverse=True)
+        top0 = ranked0[0][1]
+        sec0 = ranked0[1][1] if len(ranked0) > 1 else 0.0
+        # Rotated floor plans (90/270 deg) can lower CLIP margin; average with 90-deg view when ambiguous
+        if top0 < 0.42 or (top0 - sec0) < 0.08:
+            scores90 = _single_pass(image.rotate(90, expand=True))
+            if scores90:
+                all_keys = set(scores0) | set(scores90)
+                return {k: 0.5 * (scores0.get(k, 0.0) + scores90.get(k, 0.0)) for k in all_keys}
+        return scores0
+
+    def _classify_image(self, file_path: Path) -> str:
+        """Classify a raster drawing via dataset provenance, CLIP, and structural geometry."""
         source = next((part.lower() for part in file_path.parts
                        if part.lower() in {"cubicasa5k", "swiss_dwellings"}), None)
         if source:
             return "floor_plan"
 
         try:
-            from PIL import Image, UnidentifiedImageError
-            with Image.open(file_path) as image:
-                image = image.convert("RGB")
+            from PIL import Image, ImageOps, UnidentifiedImageError
+            with Image.open(file_path) as raw_img:
+                image = ImageOps.exif_transpose(raw_img).convert("RGB")
         except ImportError as exc:
             raise RuntimeError(
-                "Classifying mixed-source raster images needs Pillow, transformers, and torch. "
-                "Install them with: pip install pillow transformers torch"
+                "Classifying mixed-source raster images needs Pillow: pip install pillow"
             ) from exc
         except (UnidentifiedImageError, OSError) as exc:
             raise ValueError(f"Cannot read image file: {file_path}") from exc
 
-        if self._image_classifier is None:
-            try:
-                pipeline = import_module("transformers").pipeline
-            except ImportError as exc:
-                raise RuntimeError(
-                    "Image classification needs transformers, torch, and Pillow. "
-                    "Install them with: pip install transformers torch pillow"
-                ) from exc
-            self._image_classifier = pipeline(
-                task="zero-shot-image-classification",
-                model=self.IMAGE_MODEL,
-            )
+        clip_type = "uncertain"
+        best_score = 0.0
+        try:
+            backend = self._load_clip_backend()
+            scores_by_type = self.score_clip_image(backend, image)
+            if scores_by_type:
+                ranked = sorted(scores_by_type.items(), key=lambda kv: kv[1], reverse=True)
+                best_type, best_score = ranked[0]
+                second_score = ranked[1][1] if len(ranked) > 1 else 0.0
+                if best_score >= 0.24 and (best_score - second_score) >= 0.02:
+                    clip_type = best_type
+        except Exception:
+            clip_type = "uncertain"
 
-        predictions = self._image_classifier(image, candidate_labels=self.IMAGE_LABELS)
-        if not predictions:
-            return "uncertain"
+        if clip_type == "floor_plan":
+            return "floor_plan"
+        if clip_type in {"elevation", "section"} and best_score >= 0.32:
+            return clip_type
 
-        scores_by_type: Dict[str, float] = {}
-        for item in predictions:
-            dtype = self.LABEL_TO_TYPE.get(item["label"], "uncertain")
-            scores_by_type[dtype] = scores_by_type.get(dtype, 0.0) + float(item["score"])
-        ranked = sorted(scores_by_type.items(), key=lambda kv: kv[1], reverse=True)
-        best_type, best_score = ranked[0]
-        second_score = ranked[1][1] if len(ranked) > 1 else 0.0
-        if best_score >= 0.24 and (best_score - second_score) >= 0.03:
-            return best_type
         try:
             from image_parser import is_likely_floorplan_by_structure
-            if is_likely_floorplan_by_structure(file_path):
+            if (clip_type == "uncertain" or best_score < 0.65) and is_likely_floorplan_by_structure(file_path):
                 return "floor_plan"
         except Exception:
             pass
-        return "uncertain"
+
+        return clip_type
 
 
 # --- Execution Example ---
