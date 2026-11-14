@@ -1295,7 +1295,9 @@ def _discover_gemini_models(api_key: str) -> List[str]:
         low = name.casefold()
         if "gemini" not in low:
             continue
-        if any(skip in low for skip in ("embedding", "tts", "image", "audio", "robotics", "computer-use", "aqa")):
+        if any(skip in low for skip in (
+            "embedding", "tts", "image", "audio", "robotics", "computer-use", "aqa", "thinking", "deep-research", "lite"
+        )):
             continue
         # Prefer flash models first, then pro, then newest name descending.
         tier = 0 if "flash" in low and "lite" not in low else (1 if "flash" in low else (2 if "pro" in low else 3))
@@ -1324,16 +1326,20 @@ def _call_gemini_reasoner(api_key: str, payload_json: str) -> Dict[str, Any]:
         "gemini-2.5-flash-lite",
     ]))
 
-    body = json.dumps({
-        "systemInstruction": {"parts": [{"text": _REASONING_SYSTEM_PROMPT}]},
-        "contents": [{"role": "user", "parts": [{"text": payload_json}]}],
-        "generationConfig": {
+    def _build_body(model_name: str, *, disable_thinking: bool = True) -> bytes:
+        gen_cfg: Dict[str, Any] = {
             "temperature": 0,
             "maxOutputTokens": 2048,
             "responseMimeType": "application/json",
             "responseSchema": _REASONING_GEMINI_SCHEMA,
-        },
-    }).encode("utf-8")
+        }
+        if disable_thinking and ("2.5" in model_name or "3." in model_name or "3-" in model_name):
+            gen_cfg["thinkingConfig"] = {"thinkingBudget": 0}
+        return json.dumps({
+            "systemInstruction": {"parts": [{"text": _REASONING_SYSTEM_PROMPT}]},
+            "contents": [{"role": "user", "parts": [{"text": payload_json}]}],
+            "generationConfig": gen_cfg,
+        }).encode("utf-8")
 
     data: Optional[Dict[str, Any]] = None
     last_error: Optional[str] = None
@@ -1347,28 +1353,31 @@ def _call_gemini_reasoner(api_key: str, payload_json: str) -> Dict[str, Any]:
                 continue
             tried.add(model)
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{urllib.parse.quote(model, safe='')}:generateContent"
-            req = urllib.request.Request(
-                url,
-                data=body,
-                headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
-                method="POST",
-            )
-            try:
-                with urllib.request.urlopen(req, timeout=35.0) as resp:
-                    parsed = json.loads(resp.read().decode("utf-8"))
-                _WORKING_GEMINI_MODEL = model
-                return parsed
-            except urllib.error.HTTPError as exc:
-                err_body = ""
+            for disable_thinking in (True, False):
+                req = urllib.request.Request(
+                    url,
+                    data=_build_body(model, disable_thinking=disable_thinking),
+                    headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
+                    method="POST",
+                )
                 try:
-                    err_body = exc.read().decode("utf-8", errors="ignore").strip()
-                except Exception:
-                    pass
-                detail = err_body[:400] if err_body else exc.reason
-                last_error = f"HTTP {exc.code} for model '{model}': {detail}"
-                if exc.code == 404:
-                    continue
-                raise RuntimeError(last_error) from exc
+                    with urllib.request.urlopen(req, timeout=60.0) as resp:
+                        parsed = json.loads(resp.read().decode("utf-8"))
+                    _WORKING_GEMINI_MODEL = model
+                    return parsed
+                except urllib.error.HTTPError as exc:
+                    err_body = ""
+                    try:
+                        err_body = exc.read().decode("utf-8", errors="ignore").strip()
+                    except Exception:
+                        pass
+                    detail = err_body[:400] if err_body else exc.reason
+                    if exc.code == 400 and disable_thinking and "thinking" in detail.casefold():
+                        continue
+                    last_error = f"HTTP {exc.code} for model '{model}': {detail}"
+                    if exc.code == 404:
+                        break
+                    raise RuntimeError(last_error) from exc
         return None
 
     data = _try_models(models_to_try)
@@ -1441,7 +1450,7 @@ def request_reasoning_decision(
         "twin_relationships": twin_relationships or {},
         "files": [pack.catalog for pack in packs],
     }
-    payload_json = json.dumps(payload, ensure_ascii=False)
+    payload_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
     g_key = gemini_api_key()
     if g_key:

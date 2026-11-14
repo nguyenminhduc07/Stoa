@@ -190,7 +190,8 @@ class ConversationPipeline:
             best = predictions[0]
             second = predictions[1]["score"] if len(predictions) > 1 else 0.0
             margin = float(best["score"]) - float(second)
-            if best["score"] < 0.20 or margin < 0.04:
+            min_margin = 0.015 if best["score"] >= 0.22 else 0.04
+            if best["score"] < 0.20 or margin < min_margin:
                 self.classification_warnings[file_id] = (
                     f"Low classifier confidence: {best['label']}={best['score']:.3f}, "
                     f"runner-up={second:.3f}, margin={margin:.3f}."
