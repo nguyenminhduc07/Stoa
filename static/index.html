@@ -379,10 +379,13 @@
             label = plan.status === 'reasoned'
               ? `${plan.planner.replace('llm_grounded_reasoner', 'LLM reasoning')}${plan.operation ? ` · ${plan.operation}` : ''}`
               : `LLM reasoning · ${plan.status === 'not_configured' ? 'API key not set' : 'unavailable'}`;
+          } else if (String(plan.planner || '').startsWith('specialist_')) {
+            const fmt = plan.planner.replace('specialist_', '').toUpperCase();
+            label = `Specialist (${fmt}) · ${plan.status || 'deterministic'}${plan.llm_fallback_warning ? ' · LLM fallback' : ''}`;
           } else if (plan.planner === 'openai_function_call') {
             label = `LLM plan · ${plan.intent}${plan.target ? ` ${plan.target}` : ''}${plan.scope ? ` · ${plan.scope}` : ''}`;
           } else {
-            label = `Keyword fallback · ${plan.status === 'not_configured' ? 'LLM not configured' : 'LLM unavailable'}`;
+            label = `Specialist · ${plan.status || 'deterministic'}`;
           }
           meta.append(make('span', 'chip', label));
         }

@@ -10,8 +10,10 @@ __pycache__/
 /junction-dataset-preview/
 /models/
 
-# Local tools and machine-specific settings
+# Local tools, IDE configs, evaluation dumps, and machine-specific settings
+.vscode/
 /oda_tmp/
 ezdxf.ini
+*failures*.jsonl
 .env
 .env.*

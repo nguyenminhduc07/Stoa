@@ -4,8 +4,6 @@ pdfplumber
 Pillow
 numpy
 rapidocr_onnxruntime
-scikit-image
-svgpathtools
 # Zero-shot image type routing (downloads CLIP weights on first use):
 transformers
 # Install torch from the PyTorch selector with the desired CUDA build; a plain

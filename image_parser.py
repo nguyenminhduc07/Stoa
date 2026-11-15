@@ -1166,7 +1166,7 @@ def enrich_image_specialist_evidence(
                 }
             except Exception as exc:
                 document["floorplan_specialist_error"] = f"{type(exc).__name__}: {exc}"
-        else:
+        if "floorplan_specialist" not in document:
             geo = analyze_floorplan_geometry(source)
             if geo.get("rooms"):
                 document["floorplan_specialist"] = {
@@ -1408,7 +1408,7 @@ def answer_image_question(
         else resolve_cubicasa_weights(cubicasa_weights_path, auto_download=False)
     )
 
-    from train_floorplan_model import question_category
+    from floorplan_model import question_category
 
     category = question_category(question)
     folded_q = _fold_text(question)
@@ -1440,21 +1440,30 @@ def answer_image_question(
                 "reason": "The image parser cannot isolate a room count to the requested sub-area or level yet.",
                 "evidence": [evidence],
             }
+        regions = None
+        model_name = None
+        method = None
         if resolved_cubicasa_weights is not None:
-            geometry = _cubicasa_prediction(source, cubicasa_repo_path, resolved_cubicasa_weights)
-            document["floorplan_specialist"] = geometry
-            regions = geometry["rooms"]
-            model_name = geometry["model"]
-            method = "cubicasa5k_indoor_room_segmentation_components"
-        elif geometry_model_path is not None:
-            geometry = _geometry_prediction(source, geometry_model_path)
-            document["floorplan_specialist"] = geometry
-            excluded = {"background", "outdoor", "wall", "railing"}
-            regions = [item for item in geometry["rooms"]
-                       if str(item.get("class", "")).casefold() not in excluded]
-            model_name = "floorplan_geometry_checkpoint"
-            method = "shared_geometry_indoor_room_components"
-        else:
+            try:
+                geometry = _cubicasa_prediction(source, cubicasa_repo_path, resolved_cubicasa_weights)
+                document["floorplan_specialist"] = geometry
+                regions = geometry["rooms"]
+                model_name = geometry["model"]
+                method = "cubicasa5k_indoor_room_segmentation_components"
+            except Exception:
+                regions = None
+        if regions is None and geometry_model_path is not None:
+            try:
+                geometry = _geometry_prediction(source, geometry_model_path)
+                document["floorplan_specialist"] = geometry
+                excluded = {"background", "outdoor", "wall", "railing"}
+                regions = [item for item in geometry["rooms"]
+                           if str(item.get("class", "")).casefold() not in excluded]
+                model_name = "floorplan_geometry_checkpoint"
+                method = "shared_geometry_indoor_room_components"
+            except Exception:
+                regions = None
+        if regions is None:
             geo = analyze_floorplan_geometry(source)
             regions = geo["rooms"]
             document["floorplan_specialist"] = {
@@ -1562,6 +1571,7 @@ def answer_image_question(
         return {
             "status": "answered", "value": len(regions), "answer": len(regions), "unit": "count",
             "answer_text": f"{len(regions)} {answer_label}",
+            "reason": f"Detected {len(regions)} {answer_label} from floor-plan segmentation geometry.",
             "method": "cubicasa5k_pretrained_segmentation_components",
             "model": geometry["model"], "review_recommended": True,
             "evidence": region_evidence,

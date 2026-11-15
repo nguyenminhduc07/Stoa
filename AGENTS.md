@@ -25,16 +25,15 @@ format: IFC > DXF > vector PDF > raster image.
 | `evaluate_bim_area.py` | eval for IFC area questions | Duc |
 | `cad_parser.py` | DXF/DWG parsing (Swiss dwellings) | Duc |
 | `pdf_parser.py` / `evaluate_pdf_text.py` | PDF schedules + eval | Duc |
-| `image_parser.py`, `floorplan_model.py`, `floorplan_geometry_model.py`, `train_floorplan*.py`, `prepare_cubicasa_masks.py` | raster evidence and floor-plan CNNs | Codex |
+| `image_parser.py`, `floorplan_model.py`, `floorplan_geometry_model.py` | raster evidence and floor-plan segmentation | Codex |
 | `cad_qa.py` / `evaluate_cad.py` | DXF floor-plan answers (Swiss dwellings) + eval | Minh |
 | `evaluate_all.py` | routes every question to its answerer, one overall score | Minh |
 | `room_label_qa.py` | CubiCasa room-type counts from OCR of room labels | Minh |
 | `ifc_qa.py` | IFC element counts and wall/slab length, side area, volume | Minh |
-| _(add yours here)_ | | |
 | `conversation_pipeline.py` | per-conversation file manifest, parser cache, and question router | Codex |
-| `chat_api.py` | conversation-scoped REST upload and question API | Codex |
-| `llm_query_planner.py` | optional LLM query planning with schema validation | Codex |
+| `chat_api.py` / `static/index.html` | conversation-scoped REST upload, question API, and web UI | Codex |
 | `llm_reasoner.py` | structured parser EvidencePacks + grounded LLM reasoning | Duc |
+| `README.md` | repository overview, architecture, setup, and benchmark docs | Duc |
 
 Only edit files you own. If you must change someone else's file, keep the diff minimal and
 say so in the PR description.

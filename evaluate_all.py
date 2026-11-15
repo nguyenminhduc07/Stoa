@@ -196,7 +196,7 @@ class Router:
             return "pdf", answer_pdf_question(question, self._cached("pdf", path, parse_pdf))
         if suffix in IMAGE_EXTENSIONS:
             from room_label_qa import SUPPORTED, answer_room_question
-            from train_floorplan_model import question_category
+            from floorplan_model import question_category
             category = question_category(question)
             if category in SUPPORTED:
                 return "image-ocr", answer_room_question(question, path, category)
@@ -304,7 +304,7 @@ def evaluate(questions_path: Path, data_dir: Path, *, image_model: Optional[Path
 
 def _holdout_rows(rows, questions_path: Path, data_dir: Path):
     """Keep image questions only for drawings in the CNN's validation split."""
-    from train_floorplan_model import load_image_labels, split_by_image
+    from floorplan_model import load_image_labels, split_by_image
     _, validation = split_by_image(load_image_labels(questions_path, data_dir.parent))
     keep = {Path(p).resolve() for p in validation}
     out = []

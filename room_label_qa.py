@@ -148,7 +148,7 @@ def _storeys(labels: Dict[int, List[Dict[str, Any]]]) -> Tuple[int, List[Dict[st
 def answer_room_question(question: str, image_path: str | Path, category: Optional[str] = None) -> Dict[str, Any]:
     """Answer a room-type count question for one raster floor plan."""
     if category is None:
-        from train_floorplan_model import question_category
+        from floorplan_model import question_category
         category = question_category(question)
     if category not in SUPPORTED:
         return {"status": "unsupported", "reason": f"Room-label OCR does not handle {category!r}."}

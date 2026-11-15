@@ -1372,6 +1372,11 @@ def _call_gemini_reasoner(api_key: str, payload_json: str) -> Dict[str, Any]:
             "generationConfig": gen_cfg,
         }).encode("utf-8")
 
+    try:
+        timeout_sec = max(10.0, float(get_env_setting("STOA_LLM_TIMEOUT_SECONDS") or "45"))
+    except ValueError:
+        timeout_sec = 45.0
+
     data: Optional[Dict[str, Any]] = None
     last_error: Optional[str] = None
     tried: set[str] = set()
@@ -1392,7 +1397,7 @@ def _call_gemini_reasoner(api_key: str, payload_json: str) -> Dict[str, Any]:
                     method="POST",
                 )
                 try:
-                    with urllib.request.urlopen(req, timeout=25.0) as resp:
+                    with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
                         parsed = json.loads(resp.read().decode("utf-8"))
                     _WORKING_GEMINI_MODEL = model
                     return parsed
@@ -1406,9 +1411,16 @@ def _call_gemini_reasoner(api_key: str, payload_json: str) -> Dict[str, Any]:
                     if exc.code == 400 and disable_thinking and "thinking" in detail.casefold():
                         continue
                     last_error = f"HTTP {exc.code} for model '{model}': {detail}"
-                    if exc.code in {404, 429, 503}:
+                    if _WORKING_GEMINI_MODEL == model:
+                        _WORKING_GEMINI_MODEL = None
+                    if exc.code in {404, 408, 429, 500, 502, 503, 504}:
                         break
                     raise RuntimeError(last_error) from exc
+                except (TimeoutError, urllib.error.URLError, OSError) as exc:
+                    last_error = f"{type(exc).__name__} for model '{model}': {exc}"
+                    if _WORKING_GEMINI_MODEL == model:
+                        _WORKING_GEMINI_MODEL = None
+                    break
         return None
 
     data = _try_models(models_to_try)
@@ -1608,23 +1620,37 @@ def execute_reasoning_decision(
     combined_method = f"llm_grounded_reasoning ({provider}) + " + ", ".join(methods[:3])
     review_rec = any(node.review_recommended for node in selected_nodes)
 
-    if operation == "count_selected":
-        if pack.format == "image" and selected_nodes and all(
-            n.kind in {"ocr_room_label", "ocr_text_line"} for n in selected_nodes
+    def _violates_geometric_count_guardrail() -> bool:
+        if pack.format != "image" or not selected_nodes:
+            return False
+        if not any(n.kind in {"ocr_room_label", "ocr_text_line"} for n in selected_nodes):
+            return False
+        q_cf = question.casefold()
+        label_only_cues = (
+            "wc", "restroom", "toilet room", "powder room", "sauna", "löyly", "loyly",
+            "parveke", "balcon", "terrace", "patio", "porch", "deck", "veranda", "loggia",
+            "storey", "storeys", "kerros", "etage", "étage", "geschoss", "korrus", "label", "text",
+        )
+        if any(cue in q_cf for cue in label_only_cues):
+            return False
+        if operation == "count_selected":
+            return True
+        if unit == "count" or re.search(
+            r"\b(?:how\s+many|number\s+of|count|kuinka\s+monta|montako|wie\s+viele|anzahl|combien|hvor\s+mange|mitu)\b",
+            q_cf,
         ):
-            q_cf = question.casefold()
-            label_only_cues = (
-                "wc", "restroom", "toilet room", "powder room", "sauna", "löyly", "loyly",
-                "parveke", "balcon", "terrace", "patio", "porch", "deck", "veranda", "loggia",
-                "storey", "storeys", "kerros", "etage", "étage", "geschoss", "korrus", "label", "text",
-            )
-            if question and not any(cue in q_cf for cue in label_only_cues):
-                return pack, {
-                    "status": "not_found",
-                    "answer": None,
-                    "reason": "Room and symbol counts on floor plans must be derived from geometric regions, not partial OCR text labels.",
-                    "evidence": [],
-                }
+            return True
+        return False
+
+    if _violates_geometric_count_guardrail():
+        return pack, {
+            "status": "not_found",
+            "answer": None,
+            "reason": "Room and symbol counts on floor plans must be derived from geometric regions, not partial OCR text labels.",
+            "evidence": [],
+        }
+
+    if operation == "count_selected":
         total_count = sum(int(node.count) for node in selected_nodes)
         return pack, {
             "status": "answered",

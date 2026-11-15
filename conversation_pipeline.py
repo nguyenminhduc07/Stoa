@@ -93,7 +93,7 @@ def _image_question_needs_ocr(question: str) -> bool:
     ):
         return True
     try:
-        from train_floorplan_model import question_category
+        from floorplan_model import question_category
         cat = question_category(question)
         if cat in {"wc_rooms", "saunas", "balconies", "storeys"}:
             return True
@@ -988,15 +988,26 @@ class ConversationPipeline:
                     forced_file_id=file_id,
                     candidate_entries=self._candidate_entries(None),
                 )
-                if llm_res is not None:
+                if llm_res is not None and "not partial OCR text labels" not in str(llm_res.get("reason") or ""):
                     return llm_res
-            return {
-                "status": "clarification_required",
-                "answer": "Multiple unrelated drawings are loaded in this conversation. Please select a drawing or mention its file name.",
-                "reason": "Question could apply to multiple uploaded drawings.",
-                "options": clarification_options,
-                "evidence": [],
-            }
+                if llm_res is not None and llm_res.get("file_id") in self.files:
+                    _, group_entries, _ = self._select_group_for_question(question, llm_res["file_id"])
+                if not group_entries:
+                    return {
+                        "status": "clarification_required",
+                        "answer": "Multiple unrelated drawings are loaded in this conversation. Please select a drawing or mention its file name.",
+                        "reason": "Question could apply to multiple uploaded drawings.",
+                        "options": clarification_options,
+                        "evidence": [],
+                    }
+            else:
+                return {
+                    "status": "clarification_required",
+                    "answer": "Multiple unrelated drawings are loaded in this conversation. Please select a drawing or mention its file name.",
+                    "reason": "Question could apply to multiple uploaded drawings.",
+                    "options": clarification_options,
+                    "evidence": [],
+                }
 
         # Direct Tier-2 execution for compositional queries or injected test reasoners
         if bypass_tier1:
